@@ -1,0 +1,16 @@
+defaults:
+  - base_dataset
+
+_name: latent_dataset
+dataset_dir: data/mini/pusht_latent
+horizon: 16
+val_horizon: 16
+skip_frame: 1
+pad_after: 7
+pad_before: 1
+skip_idx: 1
+goal_sample: intermediate
+action_mode: bimanual_push
+resolution: 128
+obs_keys: [camera_1_color]
+bootstrap_seed: null

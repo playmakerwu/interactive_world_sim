@@ -21,7 +21,9 @@ def create_indices(
 
     indices = list()
     for i in range(len(episode_ends)):
-        if not episode_mask[i]:
+        # Support both bool mask (0/1) and integer count mask (0/1/2/...)
+        repeat_count = int(episode_mask[i])
+        if repeat_count <= 0:
             # skip episode
             continue
         start_idx = 0
@@ -34,22 +36,24 @@ def create_indices(
         max_start = episode_length - sequence_length + pad_after
 
         # range stops one idx before end
-        for idx in range(min_start, max_start + 1):
-            buffer_start_idx = max(idx, 0) + start_idx
-            buffer_end_idx = min(idx + sequence_length, episode_length) + start_idx
-            start_offset = buffer_start_idx - (idx + start_idx)
-            end_offset = (idx + sequence_length + start_idx) - buffer_end_idx
-            sample_start_idx = 0 + start_offset
-            sample_end_idx = sequence_length - end_offset
-            if debug:
-                assert start_offset >= 0
-                assert end_offset >= 0
-                assert (sample_end_idx - sample_start_idx) == (
-                    buffer_end_idx - buffer_start_idx
+        # Repeat indices repeat_count times (for bootstrap resampling)
+        for _rep in range(repeat_count):
+            for idx in range(min_start, max_start + 1):
+                buffer_start_idx = max(idx, 0) + start_idx
+                buffer_end_idx = min(idx + sequence_length, episode_length) + start_idx
+                start_offset = buffer_start_idx - (idx + start_idx)
+                end_offset = (idx + sequence_length + start_idx) - buffer_end_idx
+                sample_start_idx = 0 + start_offset
+                sample_end_idx = sequence_length - end_offset
+                if debug:
+                    assert start_offset >= 0
+                    assert end_offset >= 0
+                    assert (sample_end_idx - sample_start_idx) == (
+                        buffer_end_idx - buffer_start_idx
+                    )
+                indices.append(
+                    [buffer_start_idx, buffer_end_idx, sample_start_idx, sample_end_idx]
                 )
-            indices.append(
-                [buffer_start_idx, buffer_end_idx, sample_start_idx, sample_end_idx]
-            )
     indices = np.array(indices)
     return indices
 
@@ -114,7 +118,9 @@ class SequenceSampler:
 
         episode_ends = replay_buffer.episode_ends[:]
         if episode_mask is None:
-            episode_mask = np.ones(episode_ends.shape, dtype=bool)
+            episode_mask = np.ones(episode_ends.shape, dtype=np.int64)
+        # Ensure integer type for create_indices (supports both bool and int)
+        episode_mask = episode_mask.astype(np.int64)
 
         if np.any(episode_mask):
             indices = create_indices(
