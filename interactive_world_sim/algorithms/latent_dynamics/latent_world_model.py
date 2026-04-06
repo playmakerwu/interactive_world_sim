@@ -41,6 +41,12 @@ class LatentWorldModel(BasePytorchAlgo):
         self.training_stage = cfg.training_stage
         assert self.training_stage in [1, 2, 3], "Invalid training stage"
         self.load_ae = cfg.load_ae if "load_ae" in cfg else None
+        self.dynamics_init_seed = (
+            cfg.dynamics_init_seed if "dynamics_init_seed" in cfg else None
+        )
+        self.use_prebaked_latent = (
+            cfg.use_prebaked_latent if "use_prebaked_latent" in cfg else False
+        )
         super().__init__(cfg)
         self.normalizer = LinearNormalizer()
         self.validation_step_outputs: list = []
@@ -86,26 +92,32 @@ class LatentWorldModel(BasePytorchAlgo):
             dtype=self.dtype,
         )
 
-        # dynamics
+        # dynamics — apply seed for ensemble diversity
+        if self.dynamics_init_seed is not None:
+            torch.manual_seed(self.dynamics_init_seed)
+            torch.cuda.manual_seed(self.dynamics_init_seed)
         self.dynamics: EinopsWrapper = EinopsWrapper(
             from_shape="f b c h w",
             to_shape="b c f h w",
             module=hydra.utils.instantiate(self.cfg.dynamics),
         )
 
-        # encoder
-        latent_ch = self.num_latent_channel
-        encoder_module_ls = [nn.Conv2d(self.cfg.x_shape[0], latent_ch, 3, padding=1)]
-        for _ in range(self.num_latent_downsample):
-            encoder_module_ls.extend(
-                [
-                    nn.SiLU(),
-                    nn.Conv2d(latent_ch, latent_ch, kernel_size=3, padding=1),
-                    nn.SiLU(),
-                    nn.Conv2d(latent_ch, latent_ch, kernel_size=3, padding=1, stride=2),
-                ]
-            )
-        self.encoder = nn.Sequential(*encoder_module_ls)
+        # encoder — skip building if using pre-baked latents in Stage 2
+        if self.use_prebaked_latent and self.training_stage == 2:
+            self.encoder = nn.Sequential()  # placeholder (never used)
+        else:
+            latent_ch = self.num_latent_channel
+            encoder_module_ls = [nn.Conv2d(self.cfg.x_shape[0], latent_ch, 3, padding=1)]
+            for _ in range(self.num_latent_downsample):
+                encoder_module_ls.extend(
+                    [
+                        nn.SiLU(),
+                        nn.Conv2d(latent_ch, latent_ch, kernel_size=3, padding=1),
+                        nn.SiLU(),
+                        nn.Conv2d(latent_ch, latent_ch, kernel_size=3, padding=1, stride=2),
+                    ]
+                )
+            self.encoder = nn.Sequential(*encoder_module_ls)
 
         # load previous trained model
         if self.load_ae is not None:
@@ -124,6 +136,13 @@ class LatentWorldModel(BasePytorchAlgo):
             if self.training_stage == 3:
                 self.dynamics.load_state_dict(diffae.dynamics.state_dict())
             self.decoder.load_state_dict(diffae.decoder.state_dict())
+
+        # Explicitly freeze AE in Stage 2 (saves ~30% VRAM by not computing grads)
+        if self.training_stage == 2:
+            for p in self.encoder.parameters():
+                p.requires_grad = False
+            for p in self.decoder.parameters():
+                p.requires_grad = False
 
         self.validation_fid_model = (
             FrechetInceptionDistance(feature=64) if "fid" in self.metrics else None
@@ -485,8 +504,84 @@ class LatentWorldModel(BasePytorchAlgo):
 
         return t.long(), s.long()
 
+    def _training_step_prebaked(self, batch: dict, batch_idx: int) -> STEP_OUTPUT:
+        """Stage 2 training with pre-encoded latent tensors (no encoder needed)."""
+        z = batch["latent"].float()  # (B, T, C, H, W)
+        action = self.normalizer["action"].normalize(batch["action"]).float()
+
+        z = rearrange(z, "b t c h w -> t b c h w")
+        action = rearrange(action, "b t a -> t b a")
+
+        t, s = self._generate_noise_levels(z, self.dyn_infer_steps)
+        weights_t = self.noise_scheduler.get_weights(t)
+        weights_s = self.noise_scheduler.get_weights(s)
+        noisy_z_t, noisy_z_s = self.noise_scheduler.add_noise_to_t_s(z, t, s)
+
+        u = torch.zeros_like(t).to(self.device)
+        if self.mask_prev_action:
+            action[:-1] = 0
+        pred_s = self._forward(
+            self.dynamics,
+            noisy_z_t,
+            t,
+            s,
+            external_cond=action,
+        )
+        if self.dyn_infer_steps > 1:
+            pred_u = self._forward(
+                self.dynamics,
+                noisy_z_s,
+                s,
+                u,
+                external_cond=action,
+            )
+
+        output_dict = {}
+
+        if self.last_frame_loss_only:
+            loss_s = F.mse_loss(pred_s[-1:], noisy_z_s[-1:].detach(), reduction="none")
+            weights_t = weights_t.view(
+                *weights_t.shape, *((1,) * (loss_s.ndim - 2))
+            )[-1:]
+            loss_s = loss_s * weights_t
+            if self.dyn_infer_steps > 1:
+                loss_u = F.mse_loss(pred_u[-1:], z[-1:].detach(), reduction="none")
+                weights_s = weights_s.view(
+                    *weights_s.shape, *((1,) * (loss_u.ndim - 2))
+                )[-1:]
+                loss_u = loss_u * weights_s
+                loss = loss_s + loss_u
+            else:
+                loss = loss_s
+            loss = loss.mean()
+        else:
+            loss_s = F.mse_loss(pred_s, noisy_z_s.detach(), reduction="none")
+            weights_t = weights_t.view(
+                *weights_t.shape, *((1,) * (loss_s.ndim - 2))
+            )
+            loss_s = loss_s * weights_t
+            if self.dyn_infer_steps > 1:
+                loss_u = F.mse_loss(pred_u, z.detach(), reduction="none")
+                weights_s = weights_s.view(
+                    *weights_s.shape, *((1,) * (loss_s.ndim - 2))
+                )
+                loss_u = loss_u * weights_s
+                loss = loss_s + loss_u
+            else:
+                loss = loss_s
+            loss = loss.mean()
+
+        output_dict["loss"] = loss
+        self.log("training/loss", output_dict["loss"])
+        return output_dict
+
     def training_step(self, batch: dict, batch_idx: int) -> STEP_OUTPUT:
         """Training step of the model"""
+        # --- Pre-baked latent fast path (Stage 2 with LatentDataset) ---
+        if "latent" in batch and self.training_stage == 2:
+            return self._training_step_prebaked(batch, batch_idx)
+
+        # --- Original path (RGB input) ---
         if batch["obs"][self.obs_keys[0]].shape[0] == 0:
             return None
         # normalize input
