@@ -39,6 +39,8 @@ dec_infer_steps: 3
 last_frame_loss_only: False
 prev_frame_noise_scale: 0.1
 robust_latent: False
+dynamics_init_seed: ${eval:'None'}
+use_prebaked_latent: False
 
 delta: ${eval:'0.00054 * ${algorithm.num_latent_channel} * ${algorithm.latent_resolution} * ${algorithm.latent_resolution}'}
 

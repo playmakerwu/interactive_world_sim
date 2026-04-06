@@ -132,7 +132,8 @@ class LatentWorldModel(BasePytorchAlgo):
                 map_location=self.device,
                 weights_only=False,
             )
-            self.encoder.load_state_dict(diffae.encoder.state_dict())
+            if not (self.use_prebaked_latent and self.training_stage == 2):
+                self.encoder.load_state_dict(diffae.encoder.state_dict())
             if self.training_stage == 3:
                 self.dynamics.load_state_dict(diffae.dynamics.state_dict())
             self.decoder.load_state_dict(diffae.decoder.state_dict())
@@ -506,8 +507,9 @@ class LatentWorldModel(BasePytorchAlgo):
 
     def _training_step_prebaked(self, batch: dict, batch_idx: int) -> STEP_OUTPUT:
         """Stage 2 training with pre-encoded latent tensors (no encoder needed)."""
-        z = batch["latent"].float()  # (B, T, C, H, W)
+        z = batch["latent"].float().to(self.device)  # (B, T, C, H, W)
         action = self.normalizer["action"].normalize(batch["action"]).float()
+        action = action.to(self.device)
 
         z = rearrange(z, "b t c h w -> t b c h w")
         action = rearrange(action, "b t a -> t b a")
