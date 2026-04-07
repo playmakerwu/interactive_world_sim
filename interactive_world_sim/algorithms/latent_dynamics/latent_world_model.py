@@ -145,6 +145,7 @@ class LatentWorldModel(BasePytorchAlgo):
             for p in self.decoder.parameters():
                 p.requires_grad = False
 
+        # Validation metric models — freeze to prevent optimizer state allocation
         self.validation_fid_model = (
             FrechetInceptionDistance(feature=64) if "fid" in self.metrics else None
         )
@@ -154,6 +155,11 @@ class LatentWorldModel(BasePytorchAlgo):
         self.validation_fvd_model: FrechetVideoDistance = (
             FrechetVideoDistance() if "fvd" in self.metrics else None
         )
+        # Freeze all validation metric models (they should never be trained)
+        for m in [self.validation_fid_model, self.validation_lpips_model, self.validation_fvd_model]:
+            if m is not None:
+                for p in m.parameters():
+                    p.requires_grad = False
 
     def set_normalizer(self, normalizer: LinearNormalizer) -> None:
         """Set the normalizer for the model"""
@@ -368,6 +374,10 @@ class LatentWorldModel(BasePytorchAlgo):
         self, batch: dict, batch_idx: int, namespace: str = "validation"
     ) -> STEP_OUTPUT:
         """Validation step of the model"""
+        # --- Pre-baked latent fast path (Stage 2 with LatentDataset) ---
+        if "latent" in batch and self.training_stage == 2:
+            return self._validation_step_prebaked(batch, batch_idx, namespace)
+
         # compute diffusion loss
         # (B, T, C, H, W)
         obs_ls = [self.normalizer[k].normalize(batch["obs"][k]) for k in self.obs_keys]
@@ -504,6 +514,48 @@ class LatentWorldModel(BasePytorchAlgo):
         s = torch.cat([prev_noise_levels, last_s], 0)
 
         return t.long(), s.long()
+
+    def _validation_step_prebaked(
+        self, batch: dict, batch_idx: int, namespace: str = "validation"
+    ) -> STEP_OUTPUT:
+        """Stage 2 validation with pre-encoded latent tensors."""
+        z_gt = batch["latent"].float().to(self.device)  # (B, T, C, H, W)
+        action = self.normalizer["action"].normalize(
+            batch["action"]
+        ).float().to(self.device)
+
+        z_0 = z_gt[:, 0]
+        z_seq_ls = []
+        z_last = z_0.clone()
+        horizon = z_gt.shape[1]
+
+        for i in range(1, action.shape[1], horizon):
+            action_chunk = action[:, i : i + horizon]
+            init_action_size = action_chunk.shape[1]
+            if init_action_size < horizon:
+                action_chunk = F.pad(
+                    action_chunk,
+                    (0, 0, 0, horizon - action_chunk.shape[1]),
+                    mode="replicate",
+                )
+            z_seq = self.dynamics_forward(
+                z_last[:, None],
+                action_chunk,
+            )
+            z_seq = z_seq[:, :init_action_size]
+            z_seq_ls.append(z_seq)
+            z_last = z_seq[:, -1].clone()
+
+        z_seq = torch.cat(z_seq_ls, 1)
+        z_seq = torch.cat([z_0.unsqueeze(1), z_seq], 1)
+        val_loss = F.mse_loss(z_seq, z_gt, reduction="none")
+        val_loss = val_loss[:, 1:].mean()
+        self.log(f"{namespace}/dyn_loss", val_loss)
+        if "dyn_loss" not in self.validation_metrics:
+            self.validation_metrics["dyn_loss"] = []
+        self.validation_metrics["dyn_loss"].append(val_loss)
+        # Skip image rendering — no decoder/encoder available in prebaked mode
+        return
 
     def _training_step_prebaked(self, batch: dict, batch_idx: int) -> STEP_OUTPUT:
         """Stage 2 training with pre-encoded latent tensors (no encoder needed)."""

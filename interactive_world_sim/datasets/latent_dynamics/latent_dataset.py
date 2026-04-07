@@ -1,14 +1,23 @@
 """Dataset that loads pre-encoded latent tensors (.pt) for Stage 2 training.
 
-Eliminates encoder forward pass and RGB I/O during training.
-Supports trajectory-level bootstrapping via bootstrap_seed.
+ARCHITECTURE: Strict Lazy Loading
+==================================
+__init__  → only loads metadata.pt (~1 KB) and stores file paths (strings)
+__getitem__ → loads ONE episode .pt from disk on demand, slices the window
+
+This eliminates the catastrophic memory explosion caused by:
+1. Eagerly loading all .pt files into a giant numpy array in __init__
+2. torch.cat() creating peak 3x memory during concatenation
+3. Linux fork() duplicating the numpy arrays across num_workers processes
+
+Memory footprint per process: ~O(1) regardless of dataset size.
 """
 
 import copy
 import glob
 import os
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -19,62 +28,15 @@ from interactive_world_sim.utils.normalizer import (
     array_to_stats,
     get_range_normalizer_from_stat,
 )
-from interactive_world_sim.utils.replay_buffer import ReplayBuffer
-from interactive_world_sim.utils.sampler import SequenceSampler
 
 from .base_dataset import BaseImageDataset
 
 
-class LatentReplayBuffer:
-    """Minimal replay buffer backed by pre-encoded .pt episode files."""
-
-    def __init__(self, split_dir: str):
-        metadata = torch.load(
-            os.path.join(split_dir, "metadata.pt"), weights_only=False
-        )
-        self.episode_ends = metadata["episode_ends"]  # np.int64 array
-        self.n_episodes = metadata["n_episodes"]
-        self.obs_keys = metadata["obs_keys"]
-
-        # Load all episodes into contiguous arrays
-        episode_paths = sorted(
-            glob.glob(os.path.join(split_dir, "episode_*.pt")),
-            key=lambda p: int(Path(p).stem.split("_")[-1]),
-        )
-        assert len(episode_paths) == self.n_episodes, (
-            f"Expected {self.n_episodes} episodes, found {len(episode_paths)}"
-        )
-
-        latent_list = []
-        action_list = []
-        for ep_path in episode_paths:
-            ep = torch.load(ep_path, weights_only=False)
-            latent_list.append(ep["latent"])  # (T, C, H, W)
-            action_list.append(ep["action"])  # (T, A)
-
-        self._data = {
-            "latent": torch.cat(latent_list, dim=0).numpy(),  # (N_total, C, H, W)
-            "action": torch.cat(action_list, dim=0).numpy(),  # (N_total, A)
-        }
-
-    def keys(self):
-        return self._data.keys()
-
-    def __getitem__(self, key):
-        return self._data[key]
-
-    def __contains__(self, key):
-        return key in self._data
-
-
 class LatentDataset(BaseImageDataset):
-    """Dataset loading pre-encoded latent .pt files for Stage 2 dynamics training.
+    """Lazy-loading dataset for pre-encoded latent .pt files.
 
-    Config requires:
-        dataset_dir: root dir containing train/ and val/ with .pt files
-        horizon, skip_frame, pad_before, pad_after: temporal window params
-        bootstrap_seed: (optional) seed for trajectory-level bootstrap resampling
-        action_mode: action mode string (for normalizer compatibility)
+    Memory-safe: only metadata and file paths are held in memory.
+    Each __getitem__ call loads a single episode from disk and slices it.
     """
 
     def __init__(self, cfg: DictConfig) -> None:
@@ -82,6 +44,7 @@ class LatentDataset(BaseImageDataset):
 
         dataset_dir = cfg.dataset_dir
         horizon = cfg.horizon * cfg.skip_frame
+        self.horizon = horizon
         self.val_horizon = (
             cfg.val_horizon * cfg.skip_frame if "val_horizon" in cfg else horizon
         )
@@ -93,106 +56,211 @@ class LatentDataset(BaseImageDataset):
         self.pad_after = cfg.pad_after
         self.action_mode = cfg.action_mode
 
-        # Bootstrap seed for ensemble diversity
         bootstrap_seed = cfg.bootstrap_seed if "bootstrap_seed" in cfg else None
 
-        # Load pre-encoded replay buffer
+        # --- LAZY LOADING: only read metadata, never load episode data ---
         train_dir = os.path.join(dataset_dir, "train")
-        self.replay_buffer = LatentReplayBuffer(train_dir)
+        self._split_dir = train_dir
+        metadata = torch.load(
+            os.path.join(train_dir, "metadata.pt"), weights_only=False
+        )
+        self._episode_ends = metadata["episode_ends"]  # np.int64, cumulative
+        self._n_episodes = metadata["n_episodes"]
+        self._obs_keys = metadata["obs_keys"]
 
-        # Build episode mask (integer counts for bootstrap)
-        n_eps = self.replay_buffer.n_episodes
+        # Store sorted file paths (strings only — no data loaded)
+        self._episode_paths: List[str] = sorted(
+            glob.glob(os.path.join(train_dir, "episode_*.pt")),
+            key=lambda p: int(Path(p).stem.split("_")[-1]),
+        )
+        assert len(self._episode_paths) == self._n_episodes
+
+        # Compute per-episode lengths from cumulative ends
+        self._episode_lengths = np.diff(
+            np.concatenate([[0], self._episode_ends])
+        ).astype(np.int64)
+
+        # Build bootstrap mask
         if bootstrap_seed is not None:
             rng = np.random.default_rng(seed=int(bootstrap_seed))
-            bootstrap_indices = rng.choice(n_eps, size=n_eps, replace=True)
-            train_mask = np.zeros(n_eps, dtype=np.int64)
+            bootstrap_indices = rng.choice(
+                self._n_episodes, size=self._n_episodes, replace=True
+            )
+            self.train_mask = np.zeros(self._n_episodes, dtype=np.int64)
             for idx in bootstrap_indices:
-                train_mask[idx] += 1
+                self.train_mask[idx] += 1
         else:
-            train_mask = np.ones(n_eps, dtype=np.int64)
+            self.train_mask = np.ones(self._n_episodes, dtype=np.int64)
 
-        all_keys = list(self.replay_buffer.keys())
-
-        self.sampler = SequenceSampler(
-            replay_buffer=self.replay_buffer,
-            sequence_length=horizon,
-            pad_before=cfg.pad_before,
-            pad_after=cfg.pad_after,
-            episode_mask=train_mask,
-            goal_sample=self.goal_sample,
-            keys=all_keys,
-            skip_frame=cfg.skip_frame,
-            keys_to_keep_intermediate=["action"],
+        # Build sample index: list of (episode_idx, frame_offset) tuples
+        # This replaces SequenceSampler — lightweight, no data references
+        self._sample_indices = self._build_sample_indices(
+            self._episode_lengths, horizon, cfg.pad_before, cfg.pad_after,
+            self.train_mask,
         )
-        self.train_mask = train_mask
+
+        # Cache action stats for normalizer (load once, tiny memory)
+        self._action_stats = self._compute_action_stats()
+
+    @staticmethod
+    def _build_sample_indices(
+        episode_lengths: np.ndarray,
+        sequence_length: int,
+        pad_before: int,
+        pad_after: int,
+        episode_mask: np.ndarray,
+    ) -> np.ndarray:
+        """Build (episode_idx, start_offset) pairs for all valid windows."""
+        pad_before = min(max(pad_before, 0), sequence_length - 1)
+        pad_after = min(max(pad_after, 0), sequence_length - 1)
+
+        indices = []
+        for ep_idx, ep_len in enumerate(episode_lengths):
+            repeat_count = int(episode_mask[ep_idx])
+            if repeat_count <= 0:
+                continue
+            min_start = -pad_before
+            max_start = ep_len - sequence_length + pad_after
+            for _rep in range(repeat_count):
+                for offset in range(min_start, max_start + 1):
+                    indices.append((ep_idx, offset))
+
+        return np.array(indices, dtype=np.int64) if indices else np.zeros((0, 2), dtype=np.int64)
+
+    def _compute_action_stats(self) -> dict:
+        """Load all actions once to compute normalizer stats, then discard."""
+        action_chunks = []
+        for ep_path in self._episode_paths:
+            ep = torch.load(ep_path, weights_only=False)
+            action_chunks.append(ep["action"].numpy())
+        all_actions = np.concatenate(action_chunks, axis=0)
+        stats = array_to_stats(all_actions)
+        # Discard the data — only stats (a few floats) are kept
+        return stats
+
+    def _load_episode(self, ep_idx: int) -> Dict[str, np.ndarray]:
+        """Load a single episode from disk. Called per __getitem__."""
+        ep = torch.load(self._episode_paths[ep_idx], weights_only=False)
+        return {
+            "latent": ep["latent"].numpy(),  # (T, C, H, W)
+            "action": ep["action"].numpy(),  # (T, A)
+        }
 
     def get_normalizer(self, mode: str = "none", **kwargs) -> LinearNormalizer:
         normalizer = LinearNormalizer()
-        # Action normalizer
-        stat = array_to_stats(self.replay_buffer["action"])
-        normalizer["action"] = get_range_normalizer_from_stat(stat)
+        normalizer["action"] = get_range_normalizer_from_stat(self._action_stats)
         return normalizer
 
     def __len__(self) -> int:
         if self.is_val:
-            return self.replay_buffer.n_episodes // self.skip_idx
-        return len(self.sampler)
+            return self._n_episodes // self.skip_idx
+        return len(self._sample_indices)
 
     def get_validation_dataset(self) -> "LatentDataset":
         val_set = copy.copy(self)
         val_set.is_val = True
+
         val_dir = os.path.join(self.dataset_dir, "val")
-        val_set.replay_buffer = LatentReplayBuffer(val_dir)
-        val_mask = np.ones(val_set.replay_buffer.n_episodes, dtype=np.int64)
-        val_set.sampler = SequenceSampler(
-            replay_buffer=val_set.replay_buffer,
-            sequence_length=self.val_horizon,
-            pad_before=self.pad_before,
-            pad_after=self.pad_after,
-            episode_mask=val_mask,
-            skip_idx=self.skip_idx,
-            goal_sample=self.goal_sample,
-            skip_frame=self.skip_frame,
-            keys_to_keep_intermediate=["action"],
+        val_meta = torch.load(
+            os.path.join(val_dir, "metadata.pt"), weights_only=False
         )
-        val_set.train_mask = val_mask
+        val_set._split_dir = val_dir
+        val_set._episode_ends = val_meta["episode_ends"]
+        val_set._n_episodes = val_meta["n_episodes"]
+        val_set._episode_paths = sorted(
+            glob.glob(os.path.join(val_dir, "episode_*.pt")),
+            key=lambda p: int(Path(p).stem.split("_")[-1]),
+        )
+        val_set._episode_lengths = np.diff(
+            np.concatenate([[0], val_set._episode_ends])
+        ).astype(np.int64)
+        val_set.train_mask = np.ones(val_set._n_episodes, dtype=np.int64)
+        val_set._sample_indices = self._build_sample_indices(
+            val_set._episode_lengths, self.val_horizon,
+            self.pad_before, self.pad_after, val_set.train_mask,
+        )
         return val_set
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         if self.is_val:
-            epi_idx = idx * self.skip_idx
-            epi_start = (
-                self.replay_buffer.episode_ends[epi_idx - 1] if epi_idx > 0 else 0
-            )
-            epi_end = self.replay_buffer.episode_ends[epi_idx]
-            val_horizon = self.val_horizon
-            seq_end = min(epi_end, epi_start + val_horizon)
-            sample = dict()
-            for key in self.sampler.keys:
-                sample[key] = self.replay_buffer[key][epi_start:seq_end]
-                if sample[key].shape[0] < val_horizon:
-                    pad_len = val_horizon - sample[key].shape[0]
-                    pad_shape = (pad_len, *np.ones_like(sample[key].shape[1:]).tolist())
-                    sample_pad = np.tile(sample[key][-1:], pad_shape)
-                    sample[key] = np.concatenate([sample[key], sample_pad], axis=0)
-                if key in self.sampler.keys_to_keep_intermediate:
-                    inter_frames = sample[key].shape[0] // self.skip_frame
-                    sample_shape = list(sample[key].shape[1:])
-                    sample_shape[0] = sample_shape[0] * self.skip_frame
-                    sample[key] = sample[key].reshape(
-                        inter_frames, self.skip_frame, *sample[key].shape[1:]
-                    )
-                    sample[key] = sample[key].reshape(-1, *sample_shape)
-                else:
-                    sample[key] = sample[key][:: self.skip_frame]
-        else:
-            sample = self.sampler.sample_sequence(idx)
+            return self._getitem_val(idx)
+        return self._getitem_train(idx)
 
-        # Convert to tensors — output format matches Stage 2 expectations
-        latent = torch.from_numpy(sample["latent"].astype(np.float32))  # (T, C, H, W)
-        action = torch.from_numpy(sample["action"].astype(np.float32))  # (T, A)
+    def _getitem_train(self, idx: int) -> Dict[str, torch.Tensor]:
+        ep_idx, start_offset = self._sample_indices[idx]
+        ep_data = self._load_episode(ep_idx)
+        ep_len = self._episode_lengths[ep_idx]
 
-        return {
-            "latent": latent,
-            "action": action,
-        }
+        # Compute buffer/sample boundaries (mirrors create_indices logic)
+        buffer_start = max(start_offset, 0)
+        buffer_end = min(start_offset + self.horizon, ep_len)
+        sample_start = buffer_start - start_offset
+        sample_end = self.horizon - ((start_offset + self.horizon) - buffer_end)
+
+        result = {}
+        for key in ["latent", "action"]:
+            data = ep_data[key][buffer_start:buffer_end]
+
+            # Pad if needed
+            if sample_start > 0 or sample_end < self.horizon:
+                padded = np.zeros(
+                    (self.horizon,) + data.shape[1:], dtype=data.dtype
+                )
+                if sample_start > 0:
+                    padded[:sample_start] = data[0]
+                if sample_end < self.horizon:
+                    padded[sample_end:] = data[-1]
+                padded[sample_start:sample_end] = data
+                data = padded
+
+            # Apply skip_frame
+            if key == "action":
+                # Keep intermediate frames for action
+                inter_frames = self.horizon // self.skip_frame
+                data_shape = list(data.shape[1:])
+                data_shape[0] = data_shape[0] * self.skip_frame
+                data = data.reshape(
+                    inter_frames, self.skip_frame, *data.shape[1:]
+                )
+                data = data.reshape(-1, *data_shape)
+            else:
+                data = data[:: self.skip_frame]
+
+            result[key] = torch.from_numpy(data.astype(np.float32))
+
+        return result
+
+    def _getitem_val(self, idx: int) -> Dict[str, torch.Tensor]:
+        epi_idx = idx * self.skip_idx
+        ep_data = self._load_episode(epi_idx)
+        val_horizon = self.val_horizon
+        ep_len = self._episode_lengths[epi_idx]
+        seq_len = min(ep_len, val_horizon)
+
+        result = {}
+        for key in ["latent", "action"]:
+            data = ep_data[key][:seq_len]
+
+            # Pad if needed
+            if data.shape[0] < val_horizon:
+                pad_len = val_horizon - data.shape[0]
+                pad_shape = (pad_len, *np.ones_like(data.shape[1:]).tolist())
+                data = np.concatenate(
+                    [data, np.tile(data[-1:], pad_shape)], axis=0
+                )
+
+            # Apply skip_frame
+            if key == "action":
+                inter_frames = data.shape[0] // self.skip_frame
+                data_shape = list(data.shape[1:])
+                data_shape[0] = data_shape[0] * self.skip_frame
+                data = data.reshape(
+                    inter_frames, self.skip_frame, *data.shape[1:]
+                )
+                data = data.reshape(-1, *data_shape)
+            else:
+                data = data[:: self.skip_frame]
+
+            result[key] = torch.from_numpy(data.astype(np.float32))
+
+        return result

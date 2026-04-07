@@ -5,7 +5,7 @@ tasks: [training]
 
 training:
   lr: 8e-5
-  precision: 32-true
+  precision: bf16-mixed
   batch_size: 4
   max_epochs: -1
   max_steps: 200005
