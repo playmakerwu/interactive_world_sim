@@ -1,0 +1,129 @@
+# rl-games PPO + LSTM config for LatentPushT — REAL pipeline.
+#
+# Hard switch from mock to real LatentWorldModel ensemble:
+#   - obs_dim = 4096 (was 512 mock concat)
+#   - action_dim = 4 (was 2 mock)
+#   - num_actors = 256 (was 32768 mock — real diffusion is VRAM-heavy)
+#   - MLP widened to [1024, 512, 256] for the larger 4096-d input
+#   - variance_penalty_weight = 0.0 (smoke test purely on L2 distance first)
+
+params:
+  seed: 42
+
+  algo:
+    name: a2c_continuous
+
+  model:
+    name: continuous_a2c_logstd
+
+  network:
+    name: actor_critic
+    separate: False
+    space:
+      continuous:
+        mu_activation: None
+        sigma_activation: None
+        mu_init:
+          name: default
+        sigma_init:
+          name: const_initializer
+          val: 0
+        fixed_sigma: True
+    mlp:
+      units: [1024, 512, 256]    # widened for 4096-d goal-relative obs
+      activation: elu
+      d2rl: False
+      initializer:
+        name: default
+      regularizer:
+        name: None
+    rnn:
+      name: lstm
+      units: 256
+      layers: 1
+      before_mlp: False
+      concat_input: True
+      layer_norm: False
+
+  load_checkpoint: False
+  load_path: ''
+
+  config:
+    name: latent_pusht_ppo_real
+    env_name: LatentPushT
+    multi_gpu: False
+    full_experiment_name: latent_pusht_ppo_real
+
+    ppo: True
+    mixed_precision: False
+    normalize_input: True
+    normalize_value: True
+    value_bootstrap: True
+    num_actors: 256             # ↓ from 32768 — real diffusion would OOM the L40S
+    reward_shaper:
+      scale_value: 1.0
+
+    normalize_advantage: True
+    gamma: 0.99
+    tau: 0.95
+    learning_rate: 3.0e-4
+    lr_schedule: adaptive
+    schedule_type: standard
+    kl_threshold: 0.008
+    score_to_win: 100
+    max_epochs: 1000
+    save_best_after: 50
+    save_frequency: 100
+
+    grad_norm: 1.0
+    entropy_coef: 0.01           # prevent premature do-nothing collapse
+    truncate_grads: True
+    e_clip: 0.2
+
+    horizon_length: 32
+    minibatch_size: 1024         # ↓ from default for 4096-d obs
+    mini_epochs: 5
+    critic_coef: 2.0
+    clip_value: True
+    seq_length: 16               # LSTM BPTT length (must divide horizon_length)
+    bounds_loss_coef: 0.0
+    use_smooth_clamp: False
+
+    # ============================================================
+    # Custom env config — passed to LatentPushTForRLGames
+    # ============================================================
+    env_config:
+      env_kwargs:
+        # Real model paths
+        ensemble_dir: outputs/universe
+        ae_ckpt: outputs/pusht_cam1/checkpoints/best.ckpt
+        # Real pre-encoded latents
+        dataset_dir: data/mini/pusht_latent     # use data/full/pusht_latent on cluster
+        # Hardcoded dimensions for real PushT camera_1_color
+        latent_dim: 4096
+        action_dim: 4
+        # Episode
+        chunk_size: 30
+        max_steps: 30
+        # Reward (delta-L2 — pure goal seeking)
+        # NOTE: real 4096-d latent distances are O(20), not O(1) like mock.
+        # success_threshold widened to 5.0; reward_scale 0.1 to keep per-step
+        # delta in O(0.1) range comparable to PPO advantage statistics.
+        distance_mode: delta_l2
+        reward_scale: 0.1
+        success_threshold: 5.0
+        success_reward: 100.0
+        step_penalty: 0.0
+        # Variance / death penalty — DISABLED for smoke test
+        variance_threshold: 0.5
+        variance_penalty_weight: 0.0
+        death_penalty: -100.0
+        # Device
+        device: cuda
+        tb_log_interval: 100
+
+    player:
+      render: False
+      games_num: 100
+      n_game_life: 1
+      determenistic: True
