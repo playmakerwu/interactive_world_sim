@@ -58,7 +58,7 @@ class Attention(nn.Module):
 
         device_properties = torch.cuda.get_device_properties(torch.device("cuda"))
 
-        if device_properties.major >= 8 and device_properties.minor == 0:
+        if device_properties.major == 8 and device_properties.minor == 0:
             print_once(
                 "A100 GPU detected, using flash attention if input tensor is on cuda"
             )
@@ -95,11 +95,16 @@ class Attention(nn.Module):
         )
         q, k, v = map(lambda t: t.contiguous(), (q, k, v))
 
-        with sdpa_kernel(backends=backends):
-            # pylint: disable=E1102
-            hidden_states = F.scaled_dot_product_attention(
-                query=q, key=k, value=v, is_causal=is_causal
-            )
+        try:
+            with sdpa_kernel(backends=backends):
+                # pylint: disable=E1102
+                hidden_states = F.scaled_dot_product_attention(
+                    query=q, key=k, value=v, is_causal=is_causal
+                )
+        except RuntimeError as _e:
+            print(f"[attention debug] backends={backends} q.shape={tuple(q.shape)} "
+                  f"q.dtype={q.dtype} is_causal={is_causal} err={_e}")
+            raise
 
         hidden_states = rearrange(hidden_states, "b h n d -> b n (h d)")
         hidden_states = hidden_states.to(q.dtype)

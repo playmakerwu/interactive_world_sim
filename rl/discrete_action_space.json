@@ -1,0 +1,28 @@
+{
+  "description": "Discrete action space for PushT (scene=real). Derived from scripts/inference/teleoperate_keyboard.py: keyboard delta -> kybd_to_rob -> /50 -> delta added to normalized action. Each keypress produces a fixed delta of magnitude 0.02 along one of 8 directions, or noop.",
+  "scene": "real",
+  "action_dim": 4,
+  "delta": 0.02,
+  "action_names": [
+    "noop",
+    "W_left_arm_back",
+    "S_left_arm_forward",
+    "A_left_arm_left",
+    "D_left_arm_right",
+    "I_right_arm_back",
+    "K_right_arm_forward",
+    "J_right_arm_left",
+    "L_right_arm_right"
+  ],
+  "actions": {
+    "noop":               [0.0,   0.0,   0.0,   0.0],
+    "W_left_arm_back":    [0.0,   0.0,  -0.02,  0.0],
+    "S_left_arm_forward": [0.0,   0.0,   0.02,  0.0],
+    "A_left_arm_left":    [0.0,   0.0,   0.0,  -0.02],
+    "D_left_arm_right":   [0.0,   0.0,   0.0,   0.02],
+    "I_right_arm_back":   [-0.02, 0.0,   0.0,   0.0],
+    "K_right_arm_forward":[0.02,  0.0,   0.0,   0.0],
+    "J_right_arm_left":   [0.0,  -0.02,  0.0,   0.0],
+    "L_right_arm_right":  [0.0,   0.02,  0.0,   0.0]
+  }
+}

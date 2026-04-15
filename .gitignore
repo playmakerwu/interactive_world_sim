@@ -168,6 +168,7 @@ mpc_open_loop_logs/
 *.png
 *.pth
 *.npy
+*.npz
 
 outputs_dp/
 *.zip
@@ -176,3 +177,16 @@ outputs_dp/
 
 lightning_logs/
 optuna_studies/
+
+# RL outputs (training artefacts are large / regenerable)
+rl/outputs/
+
+# Presentation directory: keep small images + json + md, still drop videos/large binaries
+!pre/
+!pre/**/*.png
+!pre/**/*.json
+!pre/**/*.md
+!pre/**/*.py
+pre/**/*.mp4
+pre/**/*.pt
+pre/**/*.npz
