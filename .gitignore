@@ -172,6 +172,7 @@ mpc_open_loop_logs/
 
 # Phase-1 / Phase-3-A state-estimator artefacts (committed for reproducibility)
 !tests/state_estimator/sanity_outputs/**/*.png
+!tests/state_estimator/calibration_outputs/**/*.png
 !tests/goal_selection/state_goal.pt
 
 outputs_dp/
