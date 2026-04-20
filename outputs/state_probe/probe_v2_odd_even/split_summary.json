@@ -1,0 +1,49 @@
+{
+  "kind": "odd-even pooled (DIAGNOSTIC, leaked)",
+  "note": "Train frames with t_idx % 2 == 0; val frames with t_idx % 2 == 1. Per-episode, the pooled dataset has 10 episode ids (0..4 from original train/, 5..9 from val/).",
+  "n_total": 1999,
+  "n_train": 1000,
+  "n_val": 999,
+  "per_episode": {
+    "0": {
+      "train": 100,
+      "val": 100
+    },
+    "1": {
+      "train": 100,
+      "val": 100
+    },
+    "2": {
+      "train": 100,
+      "val": 100
+    },
+    "3": {
+      "train": 100,
+      "val": 100
+    },
+    "4": {
+      "train": 100,
+      "val": 99
+    },
+    "5": {
+      "train": 100,
+      "val": 100
+    },
+    "6": {
+      "train": 100,
+      "val": 100
+    },
+    "7": {
+      "train": 100,
+      "val": 100
+    },
+    "8": {
+      "train": 100,
+      "val": 100
+    },
+    "9": {
+      "train": 100,
+      "val": 100
+    }
+  }
+}

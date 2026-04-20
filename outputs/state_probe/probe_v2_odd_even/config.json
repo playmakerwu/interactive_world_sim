@@ -1,0 +1,28 @@
+{
+  "run_name": "probe_v2_odd_even",
+  "kind": "DIAGNOSTIC \u2014 odd/even split, LEAKED",
+  "seed": 0,
+  "arch": "MLP [4096 -> 256 -> 128 -> 4] GELU + LayerNorm",
+  "num_params": 1083012,
+  "lambda_pos": 7.0,
+  "lambda_ang": 1.0,
+  "lambda_norm": 0.01,
+  "lr": 0.0003,
+  "weight_decay": 0.0001,
+  "warmup_steps": 500,
+  "batch_size": 16,
+  "min_epochs": 20,
+  "max_epochs": 100,
+  "patience": 10,
+  "grad_clip": 1.0,
+  "overfit_threshold": 2.5,
+  "resolution": 128,
+  "best_epoch": 92,
+  "best_gate": 24.800893568992564,
+  "overfit_triggered_epochs": [
+    24
+  ],
+  "peak_mib_after_10_steps": 38.1591796875,
+  "wall_s": 12.145216464996338,
+  "verdict": "B"
+}
