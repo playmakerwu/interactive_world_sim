@@ -203,22 +203,26 @@ return.
 
 ### Probe footprint at batch 16 (architecture per §1.7)
 
-Architecture: MLP `[4096 → 512 → 256 → 128 → 4]`, GELU, LayerNorm on
-hidden layers.
+Architecture: MLP `[4096 → 256 → 128 → 4]`, GELU, LayerNorm on hidden
+layers (revised down from 2.23M to 1.08M params per Phase 2 review).
 
 | item | size |
 |------|------|
-| Params | `4096·512 + 512·256 + 256·128 + 128·4 + biases` ≈ 2.23M params |
-| Params @ fp32 | 2.23M × 4 B = **8.9 MiB** |
-| Adam state (m + v) | 2 × 8.9 = **17.8 MiB** |
-| Grad buffer | 8.9 MiB |
+| Params | `4096·256 + 256·128 + 128·4 + biases` ≈ 1.08M params |
+| Params @ fp32 | 1.08M × 4 B = **4.3 MiB** |
+| Adam state (m + v) | 2 × 4.3 = **8.6 MiB** |
+| Grad buffer | 4.3 MiB |
 | Latent batch (16, 4, 32, 32) fp32 | 16 × 4 × 32 × 32 × 4 = **256 KiB** |
-| Forward activations (16, 512) + (16, 256) + (16, 128) | ~60 KiB |
-| Backward activations | ~2× forward ≈ 120 KiB |
-| **Training-side total (peak)** | **≈ 36 MiB** |
+| Forward activations (16, 256) + (16, 128) | ~25 KiB |
+| Backward activations | ~2× forward ≈ 50 KiB |
+| Label/optim scratch + fragmentation slack | ~1 MiB |
+| **Training-side total (peak)** | **≈ 18 MiB** |
 
-36 MiB fits inside B ≈ 0.9 GiB with 25× headroom. We will not be batch-
-size-limited by memory at any credible architecture size.
+18 MiB fits inside B ≈ 0.9 GiB with ~50× headroom. The large margin is
+**intentional** — it lets us scale up to the 2.23M fallback architecture
+or the small-CNN escape hatch (§1.12) without re-planning memory, and
+absorbs any transient allocator fragmentation under a CoinRun co-tenant
+without triggering CUDA OOM. We are not batch-size-limited by memory.
 
 ### Batch size decision
 
@@ -318,23 +322,31 @@ above acceptance.
 
 ### Hidden dims and depth
 
+**Starting architecture** (revised per Phase 2 review):
+
 ```
 Input: (B, 4096)  [flattened latent]
-LinearGELU 4096 → 512
-LayerNorm 512
-LinearGELU 512 → 256
+LinearGELU 4096 → 256
 LayerNorm 256
 LinearGELU 256 → 128
 LayerNorm 128
 Linear 128 → 4
 ```
 
-Parameter count ≈ 2.23M. Training set size ≈ 999 frames → ratio
-parameters/frames ≈ 2200. This is high in absolute terms but the task
-is extremely constrained (4 scalar outputs per frame, deterministic
-labels from CV). LayerNorm + moderate depth regularises well enough at
-this scale; a 2-layer `[4096 → 256 → 4]` shallower variant is the
-fallback (§1.8 dropout also discussed).
+Parameter count ≈ `4096·256 + 256·128 + 128·4 + biases` ≈ **1.08M params**.
+Training set size ≈ 999 frames × ~1 effective-sample-per-step after
+accounting for intra-episode correlation (10 Hz ALOHA). 2.23M params
+overfits this effective sample count easily, so we start at 1.08M and
+escalate only on evidence.
+
+**Escalation rule**: scale up (back to `[4096 → 512 → 256 → 128 → 4]` at
+2.23M, then to a small CNN if still stuck) **only if** the validation
+metrics fail acceptance AND the train/val gap is small — i.e., the
+model is underfitting, not overfitting. Concretely: escalate only when
+`val_loss / train_loss < 1.5` AND `val_pos_p95_pooled > 3 px` (or angle
+equivalent) after full training. If the gap is large (>2.5), we are
+already overfitting — adding capacity worsens it; instead try
+regularisation, more labels, or dropout per §1.8.
 
 ### Output head normalisation
 
@@ -351,24 +363,58 @@ Single linear head, no activation, 4 raw outputs. Convention:
   before computing `1 − (s·s_g + c·c_g)` — one line, no training
   complication.
 
-### Loss
+### Loss (revised — adds soft unit-norm term)
 
 ```
-L = λ_pos · MSE(pos_pred, pos_true_norm)   # pos in [0,1]²
-  + λ_ang · MSE(sincos_pred, sincos_true)  # sin, cos in [-1, 1]
+L = λ_pos  · MSE(pos_pred, pos_true_norm)                     # pos in [0,1]²
+  + λ_ang  · MSE((sin_pred, cos_pred), (sin_true, cos_true))  # components in [-1, 1]
+  + λ_norm · ((sin_pred² + cos_pred²) - 1)²                   # soft unit-norm on (sin, cos)
 ```
 
 Scale analysis at the acceptance threshold (3 px, 5°):
 - Pos MSE target ≈ (3/128)² = 5.5e-4
 - sin/cos MSE target ≈ sin(2.5°)² × 2 ≈ 3.8e-3
 
-Raw sin/cos MSE is ~7× the pos MSE at acceptance. To make both terms
-contribute comparably to gradient updates, we up-weight position:
-**λ_pos = 7, λ_ang = 1**. Both terms logged separately every step so we
-can see if one stalls while the other converges.
+Raw sin/cos MSE is ~7× the pos MSE at acceptance. To make the two
+supervised terms contribute comparably to gradient updates, we up-weight
+position: **λ_pos = 7, λ_ang = 1**. The unit-norm regulariser is cheap
+and starts small: **λ_norm = 0.01**. Rationale for the regulariser:
+without any constraint during training, MSE alone lets the network
+output `(sin, cos)` with arbitrary magnitude (especially on CV-ambiguous
+frames where the bimodal θ vs θ+180 label drives the net toward small-
+magnitude outputs as a loss minimiser). Post-hoc normalisation at
+inference recovers direction but training gradient signal is weaker
+than it needs to be. The soft constraint fixes this at near-zero
+compute cost. We still apply post-hoc `(s, c) / sqrt(s² + c² + eps)` at
+RL-reward time for numerical safety — the soft regulariser doesn't
+guarantee exact unit norm.
+
+All three terms logged separately every training step so we can see if
+one stalls while the others converge. Plus a val-side diagnostic:
+**`val/mean_pred_norm = mean(sqrt(sin_pred² + cos_pred²))` every epoch**.
+If this drifts below ~0.9 or above ~1.1 during training, `λ_norm` is
+wrong — first bump to 0.05, then to 0.1.
 
 If §1.9's "angle pass, pos fail" or vice-versa outcome appears, we
-re-tune these. Starting point is simple and grounded.
+re-tune λ_pos / λ_ang. Starting point is simple and grounded.
+
+### Overfitting monitoring (required)
+
+Logged every epoch to TensorBoard and `train_log.csv`:
+
+- `train_loss`, `val_loss` — scalars
+- `val_loss / train_loss` — as its own scalar, the overfit signal
+- `val_pos_p95_pooled`, `val_angle_p95_pooled` — trajectory, not just
+  final (needed to see when overfitting begins and where best-val lives)
+- `val_pos_p95_worst_episode`, `val_angle_p95_worst_episode` — per §1.9
+- `val/mean_pred_norm` — unit-norm drift signal above
+
+**Overfit flag**: if at any point `val_loss / train_loss > 2.5`, emit a
+loud warning in the training log (`WARN: overfitting detected at epoch
+E, val/train = X`) and save a diagnostic dump to
+`outputs/state_probe/<run_name>/overfit_dumps/epoch_E.pt` containing
+a batch of val predictions and targets. Training **continues** after
+the warning — the signal is recorded but does not halt.
 
 ---
 
@@ -383,12 +429,18 @@ Concrete choices (all targetting a stable first run, not optimised):
 | LR schedule | cosine with linear warmup 500 steps, min LR 1e-6 | |
 | Weight decay | 1e-4 | LayerNorm/bias excluded |
 | Batch size | 16 (§1.5) | |
-| Epochs | 100 | 999 frames × 100 / 16 ≈ 6.2k steps — fast |
-| Early stop | val p95 pos ≤ 2 px AND val p95 ang ≤ 3° for 5 consecutive evals | evals every 100 steps |
+| Epochs | 100 max | 999 frames × 100 / 16 ≈ 6.2k steps — fast |
+| Minimum epochs | 20 | MLPs on small data can show delayed generalisation — don't stop early even if val plateaus before epoch 20 |
+| Early stop (patience) | 10 epochs on `λ_pos · val_pos_p95_pooled + λ_ang · val_angle_p95_pooled` (weights match the loss) | if best-val hasn't improved in 10 consecutive epochs, stop |
 | Gradient clip | 1.0 | L2 norm |
-| Dropout | none in first pass | add p=0.2 after LayerNorm only if overfitting |
+| Dropout | none in first pass | add `p=0.2` after each LayerNorm only if the overfit flag (§1.7) fires or train/val gap > 2.5 at end of training |
 | Mixed precision | off | model is tiny, fp32 is fine |
 | Seed | 0 for probe run; sweep 0/1/2 if acceptance is marginal | |
+
+Val evaluations every epoch (not "every 100 steps" — at batch 16 and
+999 frames, one epoch is 62 steps, so per-epoch eval is natural and
+cheap). The per-epoch cadence is consistent with the monitoring
+requirements in §1.7.
 
 Checkpoints: `outputs/state_probe/<run_name>/{best.pt, last.pt,
 train_log.csv, val_log.csv, config.yaml}`. `best.pt` is the checkpoint
@@ -401,18 +453,31 @@ is produced separately by `scripts/compute_state_goal.py` — decodes
 
 ## 1.9 Acceptance criteria — exact measurement
 
-Restated per v5 §1.3 with precise statistics:
+Restated per v5 §1.3 with precise statistics. Revision: report **both
+pooled and per-episode worst p95**; pooled is the gate, per-episode is
+diagnostic only.
 
-| criterion | metric | threshold | failure mode handling |
-|-----------|--------|-----------|------------------------|
-| Position | **p95** Euclidean error on val set, in pixels | ≤ 3 px | see below |
-| Angle | **p95** `min(|Δθ|, 360 − |Δθ|)` on val set, in degrees | ≤ 5° | see below |
-| Visual | validation grid + worst-K inspection | passes user sign-off | me |
+| criterion | metric | threshold | gate? |
+|-----------|--------|-----------|-------|
+| Position (pooled) | p95 of per-frame Euclidean error, pooled across all val frames, in pixels | ≤ 3 px | **YES — blocks merge** |
+| Angle (pooled) | p95 of `min(|Δθ|, 360 − |Δθ|)` across all val frames, in degrees | ≤ 5° | **YES — blocks merge** |
+| Position (worst episode) | max over val episodes of the within-episode p95 position error | — | NO, diagnostic |
+| Angle (worst episode) | max over val episodes of the within-episode p95 angle error | — | NO, diagnostic |
+| Visual | validation grid + worst-K inspection | user sign-off | **YES — blocks merge** |
+
+**Why both p95s**: pooled p95 is simple, interpretable, and what
+downstream RL cares about (actor gradient quality over a batch of val-
+distribution frames). Per-episode worst catches the "one val episode is
+systematically broken and the pooled metric averages it out" failure
+mode. We report per-episode worst but **don't gate on it**, because val
+episode count (5) is too small for an episode-level gate to be
+statistically meaningful — e.g., one bad episode raises the gate to an
+artificially strict level.
 
 Mean is reported for context but does not drive the decision. p95 forces
 the tails to be reasonable; a probe with mean 1 px but worst case 30 px
-on a small val set is useless for RL reward because RL rollouts will hit
-those tail cases routinely.
+is useless for RL reward because RL rollouts will hit those tail cases
+routinely.
 
 Angle error via `min(|Δθ|, 360 − |Δθ|)` handles the wrap-around: θ and
 θ+360 are the same orientation. We do NOT treat θ and θ+180 as equal
@@ -421,6 +486,19 @@ expected to resolve that, even though the CV labels are themselves
 sometimes bimodal. If the probe converges to the mean of the two modes
 instead of picking one, `min(|Δθ|, 360 − |Δθ|)` correctly penalises
 that.
+
+**Report format** (mandatory in `outputs/state_probe/<run_name>/
+acceptance_report.md`):
+
+```
+Position error: p95 pooled = X.XX px,  p95 worst-episode = Y.YY px
+                mean = Z.ZZ px
+Angle error:    p95 pooled = X.XX°,    p95 worst-episode = Y.YY°
+                mean = Z.ZZ°
+Unit-norm drift: mean(sqrt(sin² + cos²)) = V.VV (target ≈ 1.0)
+Merge gate (pooled p95 ≤ 3 px AND pooled p95 ≤ 5°): PASS / FAIL
+Visual sign-off (user review of validation grid + worst-K): PENDING / SIGNED
+```
 
 ### Visual sign-off
 
@@ -454,29 +532,34 @@ validation grid and worst-K images.
 ```
 r_state(z_pred, z_goal_state) =
     − α · ||pos_pred − pos_goal||₂ / image_diagonal
-    − β · (1 − (sin_pred·sin_goal + cos_pred·cos_goal))
+    − β · (1 − (sin_pred·sin_goal + cos_pred·cos_goal)) / 2
 ```
-where `pos_pred = (cx_pred, cy_pred)` in pixels, `image_diagonal = √(128² + 128²) ≈ 181.02`.
+where `pos_pred = (cx_pred, cy_pred)` in pixels,
+`image_diagonal = √(128² + 128²) ≈ 181.02`.
 
 ### Proposed weights
 
-**α = 1.0, β = 1.0**.
+**α = 1.0, β = 1.0** with the **angle term divided by 2** so both terms
+are intrinsically in `[0, 1]`.
 
 Reasoning:
-- The position term is in `[0, 1]` (normalised by diagonal).
-- The angle term is in `[0, 2]` (`1 − cosΔ` ranges over that).
-- Unweighted → angle dominates by 2×.
-- The cosine reward's documented failure mode is "arm-sensitive, T-block-
-  blind." The T-block's **orientation** is the specific signal the
-  cosine reward ignores most (position of the T does show up in the
-  latent's high-level structure; orientation is suppressed by the
-  L2-normalised `32`-norm constraint). So biasing the reward toward
-  angle matches the failure we're fixing.
-- A 2× angle-dominance is mild — at the acceptance threshold
-  (3 px / 5°), position contributes `-0.0166` and angle contributes
-  `-0.0038`, so actually position dominates at small errors while angle
-  dominates at large errors. This cross-over is fine; it pushes the
-  policy to first fix orientation roughly, then polish position.
+- Position term is `||Δpos||₂ / diag ∈ [0, 1]`.
+- Angle term raw is `(1 − cos Δθ) ∈ [0, 2]`; dividing by 2 puts it
+  in `[0, 1]`.
+- With both in `[0, 1]` and unit weights, position and angle contribute
+  equally when errors are proportionally large. This aligns the reward
+  design with the probe loss design (§1.7 weights `λ_pos = 7, λ_ang = 1`
+  already balance position and angle at the MSE level for acceptance-
+  scale errors — now the reward side is also balanced).
+- The earlier design had an unintended 2× angle dominance from the raw
+  `1 − cos Δθ` range. That was justified post-hoc as "matches the
+  cosine-reward failure mode," but the more honest version is: treat
+  position and angle symmetrically, and leave any future bias to an
+  explicit `α ≠ β` tuning decision after we see how RL runs behave.
+- At the acceptance threshold (3 px / 5°): position contributes
+  `-0.0166`, angle contributes `-0.0019` (half of the old `-0.0038`).
+  Both small; sanity-check that neither term saturates at the
+  acceptance boundary.
 
 ### Shaping: dense every step
 
@@ -564,11 +647,18 @@ is built in Branch B; per v5 §8.3, we do NOT exercise it.
 
 ### TensorBoard
 
-Scalar logs: `train/loss_pos`, `train/loss_ang`, `val/pos_mean`,
-`val/pos_p95`, `val/ang_mean`, `val/ang_p95`, LR, grad norm.
-Image logs: the 4 anchor-progression composite per eval. Not the full
-validation grid every eval — that's what `probe_validation_grid.png` is
-for at end-of-training.
+Scalar logs (per-epoch unless noted):
+- Training (per-step cadence ok): `train/loss_total`, `train/loss_pos`,
+  `train/loss_ang`, `train/loss_norm`, `train/lr`, `train/grad_norm`
+- Validation (per-epoch): `val/loss_total`, `val/loss_pos`,
+  `val/loss_ang`, `val/loss_norm`, `val/pos_mean`, `val/pos_p95_pooled`,
+  `val/pos_p95_worst_episode`, `val/ang_mean`, `val/ang_p95_pooled`,
+  `val/ang_p95_worst_episode`, `val/mean_pred_norm`,
+  `val/val_over_train_ratio`
+
+Image logs: the 4 anchor-progression composite per epoch eval. Not the
+full validation grid every eval — that's what
+`probe_validation_grid.png` is for at end-of-training.
 
 ---
 
@@ -595,34 +685,42 @@ for at end-of-training.
 
 ### Risk 2 — Probe val accuracy plateaus above acceptance
 
-- **Symptom**: after 100 epochs, val p95 pos > 3 px or val p95 ang > 5°,
-  not improving over last 20 epochs.
-- **Mitigation (first)**: review `train` vs `val` curves — if train loss
-  is much lower than val, add dropout 0.2 after each LayerNorm.
-- **Mitigation (second)**: if train and val both plateau, architecture
-  is underfit — switch to small CNN (spec in §1.9 split-failure
-  outcomes) OR add a `[4096 → 1024 → 256 → 4]` variant.
-- **Abandon trigger**: val p95 pos > 10 px OR val p95 ang > 15° after
-  three architecture revisions. At this point the problem is not
-  architecture; check labels or consider that the latent distribution is
-  not informative enough about T-block pose (would be a surprising
-  negative result worth reporting).
+- **Symptom**: after 100 epochs (or earlier early-stop), `val_pos_p95_pooled > 3 px`
+  or `val_ang_p95_pooled > 5°`, not improving over the last 20 epochs.
+- **Mitigation (first)** — suspected overfit: if `val_loss / train_loss > 2.5`
+  or the overfit flag (§1.7) fired, add dropout 0.2 after each LayerNorm
+  and retrain.
+- **Mitigation (second)** — suspected underfit: if `val_loss / train_loss < 1.5`
+  at the plateau, scale up. First to `[4096 → 512 → 256 → 128 → 4]`
+  (2.23M params), then to the small CNN fallback
+  `(4, 32, 32) → (32, 16, 16) → (64, 8, 8) → flatten → 4`.
+- **Abandon trigger**: `val_pos_p95_pooled > 10 px` OR `val_ang_p95_pooled > 15°`
+  after **three architecture revisions, at least one of which is the CNN
+  variant**. At that point the problem is not architecture; check labels
+  (Risk 1) or consider that the latent distribution is not informative
+  enough about T-block pose (would be a surprising negative result
+  worth reporting).
 
 ### Risk 3 — `(sin, cos)` head collapses toward (0, 0) or unit-norm drifts
 
-- **Symptom**: val sin/cos MSE converges but the predicted
-  `sqrt(sin² + cos²)` drifts away from 1 (expected 1.0, see e.g.
-  mean in logs). Or the predicted norm is consistently ≪ 1 on ambiguous
-  frames (network learning "I don't know → predict zero" as a loss
-  minimiser on bimodal labels).
-- **Mitigation (first)**: add unit-norm regulariser `γ · (s² + c² − 1)²`,
-  γ = 0.1.
+- **Symptom**: `val/mean_pred_norm` drifts below 0.9 or above 1.1
+  during training. Or the predicted norm is consistently ≪ 1 on
+  ambiguous frames (network learning "I don't know → predict zero" as a
+  loss minimiser on bimodal labels, so MSE is reduced but direction is
+  lost).
+- **Mitigation (first)**: baseline loss already includes the soft
+  unit-norm term `λ_norm · ((s² + c² − 1)²)` at `λ_norm = 0.01`
+  (§1.7). First escalation: bump `λ_norm → 0.05`. If still drifting,
+  bump to `λ_norm = 0.1`.
 - **Mitigation (second)**: inspect whether collapse is correlated with
   specific CV residual ranges (worst ICP fits → worst probe predictions)
-  and if so tighten the CV residual reject bound upstream.
-- **Abandon trigger**: regulariser doesn't restore unit norm (mean
-  predicted norm stays < 0.8 on >20% of val) — indicates labels are too
-  noisy; back to Risk 1 mitigations.
+  and if so tighten the CV residual reject bound upstream (Risk 1
+  mitigations).
+- **Abandon trigger**: `λ_norm = 0.1` still leaves `mean_pred_norm < 0.8`
+  on > 20% of val frames — indicates the CV labels are systematically
+  bimodal / inconsistent and no amount of regularisation fixes it.
+  Return to Risk 1 mitigations (HSV re-calibration, ICP residual
+  tightening) and consider a ranking-based loss instead of MSE.
 
 Secondary concerns flagged but not top-3: decoder-distribution drift vs
 training latents (cannot be validated in Branch A, surface in Branch B);
@@ -631,7 +729,26 @@ decision).
 
 ---
 
-## 1.13 Branch split recap
+## 1.13 Self-check — confirming the four coverage items
+
+Phase 2 review asked me to verify each of (a)–(d) is addressed in the
+doc. Here's the pointer table:
+
+| Item | Addressed in | Specifics |
+|------|--------------|-----------|
+| (a) Per-frame REAL-vs-WM mask agreement reported across 20 calibration frames | §1.1 (agreement reporting) + §1.3 (`agreement_flag` column in `calibration_table.csv`, + agreement-rate required in `calibration_summary.md`'s three mandatory numbers) | Every calibration row logs `n_pixels_wm_only`, `pose_delta_px`, `pose_delta_deg`, and `agreement_flag ∈ {identical, mask_differs_but_pose_agrees, mask_and_pose_differ, one_failed}` |
+| (b) Per-channel ablation: H band widening, S lower relaxation, V upper lifting tested independently | §1.2 (Per-channel relaxation test) | Six variants in the table: baseline, H ±5°, S_lower → 0, S_upper → 255, V_lower → 0, V_upper → 255. Each channel relaxed one at a time, area recovery reported per variant in `per_channel_relaxation.csv`. |
+| (c) VRAM arithmetic: concrete table with params × 4 B + Adam 2× + activation estimate | §1.5 (revised table) | Params 1.08M → fp32 4.3 MiB, Adam 2× → 8.6 MiB, grad 4.3 MiB, latent batch 256 KiB, activations 25 + 50 KiB, slack 1 MiB → peak ≈ 18 MiB. 50× headroom explicitly flagged as intentional margin, not slop. |
+| (d) Abandon triggers as specific numeric thresholds | §1.12 all three risks | Risk 1 abandon: drop rate > 20% after both mitigations OR >5/20 calibration frames visually broken. Risk 2 abandon: `val_pos_p95_pooled > 10 px` OR `val_ang_p95_pooled > 15°` after three architecture revisions including at least one CNN variant. Risk 3 abandon: `mean_pred_norm < 0.8 on >20% of val` after regulariser bumped to `λ_norm = 0.1`. |
+
+All four items were already addressed before this revision (except
+Risk 2's "at least one CNN variant" clarification and Risk 3's "after
+regulariser bumped" clarification — both added now to make the
+thresholds sharper).
+
+---
+
+## 1.14 Branch split recap
 
 All items in this design doc with concrete file impact map to v5 §2 as
 follows:
@@ -668,23 +785,67 @@ files do **not** touch `rl/models/state_probe.py`, `rl/labeling/`,
 
 ## Summary of judgment calls made without user input (flagged per §2 process rule)
 
-These I decided and wrote down. Flagging here as a batch so you can push
-back if you want:
+These I decided and wrote down. Items marked ✱ were revised per the
+Phase 2 review round:
 
 1. Label every frame (no subsampling). §1.4.
 2. No coverage stratification for val set; re-visit only if the
    validation grid shows holes. §1.4.
-3. MLP, not CNN, at 2.23M params. §1.7.
-4. Normalise position targets to `[0, 1]` for training; unit-norm (sin,
-   cos) via post-hoc division at inference, not training. §1.7.
-5. Loss weights `λ_pos = 7, λ_ang = 1`. §1.7.
-6. Reward weights `α = β = 1.0` (letting angle dominate 2×). §1.10.
+3. ✱ MLP, not CNN, **at 1.08M params** `[4096 → 256 → 128 → 4]` (shrunk
+   from 2.23M). Escalation to 2.23M and then CNN gated on underfit
+   evidence (`val/train < 1.5` at plateau). §1.7, §1.12.
+4. Normalise position targets to `[0, 1]` for training; `(sin, cos)`
+   supervised by MSE against unit-norm targets + soft unit-norm
+   regulariser during training; post-hoc `F.normalize` at inference.
+   §1.7.
+5. ✱ Loss weights `λ_pos = 7, λ_ang = 1, λ_norm = 0.01`. λ_norm added
+   this round. §1.7.
+6. ✱ Reward weights `α = β = 1.0` with the angle term divided by 2 so
+   both terms live in `[0, 1]` and contribute equally. Previous 2×
+   angle dominance was unintentional scale mismatch, now removed.
+   §1.10.
 7. Training progression viz (v5 §6.4 optional) is **in scope** for Phase
    3-A, at trivial cost. §1.11.
 8. Serial labeling pipeline, no multiprocessing, given ~6-min estimate.
    §1.6.
-9. p95 (not mean) drives acceptance. §1.9.
+9. ✱ p95 drives acceptance. **Both pooled and per-episode worst** p95
+   reported; only pooled gates merge. §1.9.
 10. Visual sign-off = user (task owner). §1.9.
+11. (new) Early stop: patience 10 epochs on the combined metric
+    `λ_pos · val_pos_p95_pooled + λ_ang · val_angle_p95_pooled`, minimum
+    20 epochs. §1.8.
+12. (new) Overfit flag at `val_loss / train_loss > 2.5` — warn + dump,
+    training continues. §1.7.
 
 If any of these is wrong, flag it in review and I'll revise. Otherwise
 Phase 3-A starts from this as written.
+
+---
+
+## Revision Notes (Phase 2 review round)
+
+Revisions from the Phase 2 review round had no second-order consequences
+that required working around. (Review-round items labelled "Review 1.x"
+below; they land in this doc at different §1.x numbers, noted in
+parentheses.) For completeness:
+
+- **Review 1.1 — Shrunk architecture** (lands in this doc's §1.7 + §1.12):
+  VRAM peak dropped from 36 MiB to 18 MiB (this doc's §1.5 recomputed).
+  Conclusion unchanged — not memory-limited. Fallback architectures
+  (2.23M MLP, small CNN) still fit inside the worst-case probe-training
+  budget with >30× headroom.
+- **Review 1.2 — λ_norm added** (lands in this doc's §1.7 + §1.11):
+  adds one extra loss-term-per-step gradient computation; cost
+  negligible. `val/mean_pred_norm` added to the TensorBoard scalar list.
+  Risk 3 mitigation ladder (§1.12) updated from "add regulariser" to
+  "bump regulariser" since the regulariser is now in the baseline loss.
+- **Review 1.3 — Reward angle /2** (lands in this doc's §1.10): pure
+  scalar change in `rl/training/reward.py` (Branch B). No impact on
+  Branch A scope or Branch A artefacts. The saved `state_goal.pt`
+  format is unchanged.
+- **Review 1.4 — Dual p95 reporting** (lands in this doc's §1.9 +
+  §1.11): adds 2 scalar logs per eval and one more line in
+  `acceptance_report.md`. No impact on training time.
+- **Review 1.5 — Self-check** (this doc's §1.13, new): existing Branch
+  split recap moved to §1.14. Sanity-check against v5 §2.1 / §2.2 file
+  lists still holds.
