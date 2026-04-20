@@ -173,6 +173,9 @@ mpc_open_loop_logs/
 # Phase-1 / Phase-3-A state-estimator artefacts (committed for reproducibility)
 !tests/state_estimator/sanity_outputs/*.png
 !tests/goal_selection/state_goal.pt
+# Bulk-labeling and probe-training summary manifests under outputs/ are tracked
+# via `git add -f` in the relevant scripts/commits — the .pt label files stay
+# ignored to keep the repo small.
 
 outputs_dp/
 *.zip
