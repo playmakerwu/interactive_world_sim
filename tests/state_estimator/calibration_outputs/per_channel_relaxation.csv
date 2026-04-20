@@ -1,0 +1,6 @@
+variant,drop_rate,mean_post_morph_px,median_post_morph_px,area_frac_of_theoretical,area_recovery_vs_real_pct_pts,mean_icp_residual,p95_icp_residual
+REAL,0.0000,513.6,512.5,1.0887,+0.00,0.3558,0.4361
+WM,0.0000,513.6,512.5,1.0887,+0.00,0.3558,0.4361
+REAL+H_wide5,0.0000,513.6,512.5,1.0887,+0.00,0.3558,0.4361
+REAL+S_lo0,0.0000,513.6,512.5,1.0887,+0.00,0.3558,0.4361
+REAL+V_hi255,0.0000,513.6,512.5,1.0887,+0.00,0.3558,0.4361
