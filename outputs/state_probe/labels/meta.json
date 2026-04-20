@@ -1,0 +1,132 @@
+{
+  "preset": "REAL",
+  "residual_max": 0.65415,
+  "contour_area_max": 943.6,
+  "wall_total_s": 190.73016929626465,
+  "splits": {
+    "train": {
+      "preset": "REAL",
+      "hsv_lower": [
+        160,
+        50,
+        100
+      ],
+      "hsv_upper": [
+        179,
+        200,
+        244
+      ],
+      "residual_max": 0.65415,
+      "contour_area_max": 943.6,
+      "resolution": 128,
+      "obs_key": "camera_1_color",
+      "ckpt": "/home/yiru-wu/Documents/interactive_world_sim/outputs/pusht_cam1/checkpoints/best.ckpt",
+      "ckpt_mtime": 1775878419.6015742,
+      "split": "train",
+      "n_total": 999,
+      "n_kept": 999,
+      "n_dropped": 0,
+      "drop_rate": 0.0,
+      "per_episode": [
+        {
+          "episode": 0,
+          "n_total": 200,
+          "n_kept": 200,
+          "n_dropped": 0,
+          "drop_rate": 0.0
+        },
+        {
+          "episode": 1,
+          "n_total": 200,
+          "n_kept": 200,
+          "n_dropped": 0,
+          "drop_rate": 0.0
+        },
+        {
+          "episode": 2,
+          "n_total": 200,
+          "n_kept": 200,
+          "n_dropped": 0,
+          "drop_rate": 0.0
+        },
+        {
+          "episode": 3,
+          "n_total": 200,
+          "n_kept": 200,
+          "n_dropped": 0,
+          "drop_rate": 0.0
+        },
+        {
+          "episode": 4,
+          "n_total": 199,
+          "n_kept": 199,
+          "n_dropped": 0,
+          "drop_rate": 0.0
+        }
+      ],
+      "wall_s": 93.75521183013916
+    },
+    "val": {
+      "preset": "REAL",
+      "hsv_lower": [
+        160,
+        50,
+        100
+      ],
+      "hsv_upper": [
+        179,
+        200,
+        244
+      ],
+      "residual_max": 0.65415,
+      "contour_area_max": 943.6,
+      "resolution": 128,
+      "obs_key": "camera_1_color",
+      "ckpt": "/home/yiru-wu/Documents/interactive_world_sim/outputs/pusht_cam1/checkpoints/best.ckpt",
+      "ckpt_mtime": 1775878419.6015742,
+      "split": "val",
+      "n_total": 1000,
+      "n_kept": 1000,
+      "n_dropped": 0,
+      "drop_rate": 0.0,
+      "per_episode": [
+        {
+          "episode": 0,
+          "n_total": 200,
+          "n_kept": 200,
+          "n_dropped": 0,
+          "drop_rate": 0.0
+        },
+        {
+          "episode": 1,
+          "n_total": 200,
+          "n_kept": 200,
+          "n_dropped": 0,
+          "drop_rate": 0.0
+        },
+        {
+          "episode": 2,
+          "n_total": 200,
+          "n_kept": 200,
+          "n_dropped": 0,
+          "drop_rate": 0.0
+        },
+        {
+          "episode": 3,
+          "n_total": 200,
+          "n_kept": 200,
+          "n_dropped": 0,
+          "drop_rate": 0.0
+        },
+        {
+          "episode": 4,
+          "n_total": 200,
+          "n_kept": 200,
+          "n_dropped": 0,
+          "drop_rate": 0.0
+        }
+      ],
+      "wall_s": 96.9562668800354
+    }
+  }
+}

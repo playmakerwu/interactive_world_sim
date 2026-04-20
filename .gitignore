@@ -174,6 +174,9 @@ mpc_open_loop_logs/
 !tests/state_estimator/sanity_outputs/**/*.png
 !tests/state_estimator/calibration_outputs/**/*.png
 !tests/goal_selection/state_goal.pt
+# Bulk-labeling and probe-training summary manifests under outputs/ are tracked
+# via `git add -f` in the relevant scripts/commits — the .pt label files stay
+# ignored to keep the repo small.
 
 outputs_dp/
 *.zip
