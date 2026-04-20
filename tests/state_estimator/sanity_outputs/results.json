@@ -1,0 +1,68 @@
+{
+  "decode": {
+    "ckpt": "/home/yiru-wu/Documents/interactive_world_sim/outputs/pusht_cam1/checkpoints/best.ckpt",
+    "z_goal": "/home/yiru-wu/Documents/interactive_world_sim/tests/goal_selection/z_goal.pt",
+    "z_shape": [
+      1,
+      4,
+      32,
+      32
+    ],
+    "z_norm": 31.999996185302734,
+    "wm_load_s": 4.2902445793151855,
+    "decode_s": 0.7428317070007324,
+    "free_mib_after_load": 4948.5,
+    "free_mib_after_decode": 4620.5,
+    "total_mib": 11782.75
+  },
+  "presets": [
+    {
+      "name": "real",
+      "hsv_lower": [
+        160,
+        50,
+        100
+      ],
+      "hsv_upper": [
+        179,
+        200,
+        244
+      ],
+      "mask_pixels": 476,
+      "contour_count": 1,
+      "largest_contour_area_px": 415.0,
+      "icp_s": 0.06160426139831543,
+      "success": true,
+      "center_px": [
+        55.50502630066731,
+        62.70268751166545
+      ],
+      "angle_deg": 1.534447759028351,
+      "icp_residual": 0.2893863688722033
+    },
+    {
+      "name": "wm",
+      "hsv_lower": [
+        140,
+        50,
+        100
+      ],
+      "hsv_upper": [
+        179,
+        255,
+        255
+      ],
+      "mask_pixels": 476,
+      "contour_count": 1,
+      "largest_contour_area_px": 415.0,
+      "icp_s": 0.0823967456817627,
+      "success": true,
+      "center_px": [
+        55.50502630066731,
+        62.70268751166545
+      ],
+      "angle_deg": 1.534447759028351,
+      "icp_residual": 0.2893863688722033
+    }
+  ]
+}
