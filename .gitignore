@@ -175,6 +175,10 @@ mpc_open_loop_logs/
 !tests/state_estimator/calibration_outputs/**/*.png
 !tests/goal_selection/state_goal_overlay.png
 # Note: !tests/goal_selection/state_goal.pt is set after the `*.pt` rule below.
+
+# MPPI diagnostic artefacts under outputs/mppi/ are force-added via
+# `git add -f` in commits — trajectory .mp4 and .pt dumps stay ignored to
+# keep the repo small (same convention as outputs/state_probe/labels).
 # Bulk-labeling and probe-training summary manifests under outputs/ are tracked
 # via `git add -f` in the relevant scripts/commits — the .pt label files stay
 # ignored to keep the repo small.
