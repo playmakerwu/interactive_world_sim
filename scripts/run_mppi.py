@@ -235,6 +235,19 @@ def main() -> None:
         help="Per-step Gaussian jitter added on top of demo chunks in "
              "'demo_jitter' mode. Small vs demo step-to-step delta ≈ 0.012.",
     )
+    ap.add_argument(
+        "--selection_rule", choices=["softmax", "argmax"], default="softmax",
+        help="How to pick the executed action from the N sampled trajectories. "
+             "'softmax' = weighted mean of first actions. 'argmax' = first "
+             "action of the single best trajectory. Argmax preserves the "
+             "temporal coherence of individual sampled action sequences.",
+    )
+    ap.add_argument(
+        "--warm_start", action="store_true",
+        help="Maintain a running H-step action sequence across plan steps. "
+             "Each step samples perturbations around this sequence and then "
+             "shifts it. Provides temporal persistence between plan_step calls.",
+    )
     args = ap.parse_args()
 
     device = "cuda:0"
@@ -313,6 +326,8 @@ def main() -> None:
             action_dim=args.action_dim, resolution=RES, device=device,
             symmetry_aware=args.symmetry_aware,
             action_sampler=action_sampler,
+            selection_rule=args.selection_rule,
+            warm_start=args.warm_start,
             labeler=labeler,
             capture_rgb=True,  # snapshots at specific steps
         )
@@ -452,6 +467,8 @@ def main() -> None:
             "symmetry_aware": bool(args.symmetry_aware),
             "action_source": args.action_source,
             "jitter_sigma": args.jitter_sigma if args.action_source == "demo_jitter" else None,
+            "selection_rule": args.selection_rule,
+            "warm_start": bool(args.warm_start),
             "N": args.N, "H": args.H, "sigma": args.sigma,
             "temperature": args.temperature, "seed": args.seed,
             "control_steps": args.control_steps,

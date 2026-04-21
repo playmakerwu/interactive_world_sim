@@ -63,6 +63,8 @@ class MPPIPlanner:
         large_penalty: float = DEFAULT_LARGE_PENALTY,
         symmetry_aware: bool = False,
         action_sampler: ActionSampler | None = None,
+        selection_rule: str = "softmax",  # or "argmax"
+        warm_start: bool = False,
         labeler: CVLabeler | None = None,
         device: str = "cuda:0",
         capture_rgb: bool = False,
@@ -94,6 +96,23 @@ class MPPIPlanner:
         self.device = device
         self.capture_rgb = capture_rgb  # Step 4/5 viz; adds a (N, H, W, 3) uint8 copy
         self.last_stats: PlanStepStats | None = None
+
+        if selection_rule not in {"softmax", "argmax"}:
+            raise ValueError(
+                f"selection_rule must be 'softmax' or 'argmax', got {selection_rule!r}"
+            )
+        self.selection_rule = selection_rule
+
+        # Warm-start maintains a running (H, A) action sequence across plan steps.
+        # Each step, samples are centred on the shifted running sequence and the
+        # running sequence is updated to the softmax-weighted mean of the current
+        # step's samples. Initialised to zeros so the first plan step behaves
+        # like the cold-start case.
+        self.warm_start = warm_start
+        if self.warm_start:
+            self._running_seq = torch.zeros(H, action_dim, device=device)
+        else:
+            self._running_seq = None
 
     def _sample_actions(self) -> torch.Tensor:
         return self.action_sampler.sample(self.N, self.H, self.device)
@@ -136,7 +155,14 @@ class MPPIPlanner:
             torch.manual_seed(int(seed))
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(int(seed))
-        actions = self._sample_actions()  # (N, H, A)
+        perturbations = self._sample_actions()  # (N, H, A)
+        if self.warm_start:
+            # Centre the sampled actions on the current running sequence.
+            # Under warm-start, the sampler is treated as a perturbation
+            # distribution rather than an absolute action distribution.
+            actions = self._running_seq.unsqueeze(0) + perturbations
+        else:
+            actions = perturbations
 
         # 2. Batched rollout through IWS dynamics.
         z0_batch = z_current.expand(self.N, -1, -1, -1).contiguous()
@@ -176,10 +202,30 @@ class MPPIPlanner:
         if torch.isnan(weights).any():
             weights = torch.full_like(weights, 1.0 / self.N)
 
-        # 6. Weighted mean of the first action of each trajectory.
+        # 6. Pick the executed action by the chosen selection rule.
         first_actions = actions[:, 0]  # (N, A)
-        a_star = (weights.unsqueeze(-1) * first_actions).sum(dim=0)  # (A,)
         a_naive_mean = first_actions.mean(dim=0)
+        if self.selection_rule == "softmax":
+            a_star = (weights.unsqueeze(-1) * first_actions).sum(dim=0)  # (A,)
+        else:
+            # argmax: pick the single first-action of the best-scoring trajectory.
+            best_idx = int(rewards_t.argmax().item())
+            a_star = first_actions[best_idx]
+
+        # 7. If warm-starting, update the running sequence and shift it for
+        # the next plan_step. The update is always the softmax-weighted mean
+        # (independent of selection_rule above) so warm-start is a temporal-
+        # smoothing prior, not an argmax commitment.
+        if self.warm_start:
+            weighted_seq = (
+                weights.view(self.N, 1, 1) * actions
+            ).sum(dim=0)  # (H, A)
+            # Shift left by 1, pad the tail with zeros so the next plan step's
+            # centre is "what we planned plus one free step".
+            last_pad = torch.zeros(1, self.action_dim, device=actions.device)
+            self._running_seq = torch.cat(
+                [weighted_seq[1:], last_pad], dim=0
+            ).to(self.device)
 
         self.last_stats = PlanStepStats(
             a_star=a_star.detach().cpu(),
