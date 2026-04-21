@@ -13,6 +13,15 @@ license = {text = "MIT"}
 where = ["."]
 include = ["interactive_world_sim*"]
 
+[tool.pytest.ini_options]
+# Without this, pytest cannot import the top-level `rl/` package unless
+# the repo has been installed editable AND pytest is launched from the
+# repo root with the right sys.path. Explicit pythonpath entry makes
+# `pytest tests/` work from anywhere, on any environment that has the
+# deps installed.
+pythonpath = ["."]
+testpaths = ["tests"]
+
 [tool.ruff.lint]
 
 # Allow unused variables when underscore-prefixed.
