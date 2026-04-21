@@ -286,6 +286,27 @@ N=128 → N=64 halves the rollout cost and roughly halves the decode
 cost, bringing per-step to ~20 s and per-run to ~15 min. Flagged
 for Step 5 decision after first cloud run.
 
+### 180°-flip forensic follow-ups (user Step 3 feedback)
+
+- **`state_goal` is θ = +0.75°** (from `state_goal.pt` metadata — nearly
+  axis-aligned). This is the flip-prone zone: a T at θ ≈ 0° and a T at
+  θ ≈ ±180° look identical under noisy HSV+ICP, so the CV labeler can
+  trivially land in the wrong branch.
+- **Flip rate on the far-start here is 4/16 ≈ 25%** (from Step 3
+  histogram: 4 samples at reward -2.2 out of 16). This matches the
+  expected flip probability when the T is roughly axis-aligned.
+- **Step 5 monitoring plan:** watch for an "all-trajectories-flipped"
+  failure mode where the reward consensus — i.e. the softmax-weighted
+  mean — lands in the flipped branch. If this happens the controller
+  will steer *away* from the goal with full confidence. Telltale:
+  reward curve has a sustained plateau near -2 with low per-step
+  variance, rather than the -2-spike-noise pattern Step 2/3 show.
+- **Fallback plan if Step 5 all-flipped:** re-run with an off-axis goal
+  (θ ≈ 45°), which makes the bar-vs-stem orientation unambiguous and
+  eliminates the 180° CV branch degeneracy. `scripts/compute_state_goal.py`
+  would need an `--angle` option, or we swap the source `z_goal` to a
+  frame with the T rotated.
+
 ### Local N-limit decision
 
 N=32 in Step 1 fit in 5.5 GiB because it was rollout-only. Step 3
@@ -298,7 +319,85 @@ histogram. No decode chunking added — explicitly out of scope per
 Step 1 feedback.
 
 ## Step 4 — Single plan step
-(pending)
+
+### What shipped
+
+- `rl/mppi/planner.py::MPPIPlanner` — constructor takes `wm`,
+  `state_goal`, and the full hyperparameter set (N, H, σ, τ,
+  action_dim, resolution, image_diagonal, large_penalty). `plan_step(z,
+  seed=...)` runs the 6-step algorithm from §Algorithm and returns the
+  executed action `a*` of shape (action_dim,).
+- `PlanStepStats` dataclass — populated as `planner.last_stats` after
+  each `plan_step`. Holds rewards, weights, labels, sampled actions,
+  final latents, and optionally the decoded RGBs when `capture_rgb=True`.
+  Step 5 depends on these for trajectory logging.
+- `tests/mppi/test_planner_step.py` — 4 tests. All pass.
+- `scripts/viz_step4_plan_step.py` — writes `rollout_samples.png`
+  (top-8 per spec), `rollout_all_sorted.png` (all N=16 sorted — the
+  smoking-gun view), `summary.json`.
+
+### Test results
+
+```
+test_plan_step_returns_finite_action                  PASSED
+test_plan_step_from_goal_has_best_reward_near_zero    PASSED   best = -0.001
+test_plan_step_is_reproducible                        PASSED
+test_last_stats_is_fully_populated                    PASSED
+```
+
+**Reproducibility subtlety:** the WM dynamics inject fresh noise per
+denoising step via the global CUDA RNG (see `world_model.py` line 126,
+the `torch.randn(... device=device)` without a generator). Seeding a
+local `torch.Generator` for action noise alone is *not* sufficient to
+reproduce `a*` — the planner must also call `torch.manual_seed` +
+`torch.cuda.manual_seed_all`. This is implemented; the caller is
+expected to pass a *different* seed per plan step during execution.
+
+### 180°-flip smoking gun (user Step 4 ask)
+
+Single plan step from the mini ep2 t=0 far latent, N=16, H=10, σ=0.1,
+seed=0. Rewards range from -2.20 (worst) to -0.21 (best). The 4x4
+sorted grid in `rollout_all_sorted.png` shows:
+
+| Cluster           | Indices (by reward rank) | reward | CV θ        | softmax weight |
+|-------------------|--------------------------|--------|-------------|----------------|
+| "normal" branch   | top 8                    | -0.21 to -0.28 | +11° to +21° | 0.08 each |
+| transition        | ranks 9–12               | -0.29 to -0.82 | +24° to +65° | 0.04–0.08 |
+| flipped branch    | ranks 13–16              | -2.18 to -2.20 | +165° to +174° | 0.012 each |
+
+Candidates ranked 13–16 are visually near-identical to candidates
+ranked 1–8 (same approximate T position (~27, 84)), but the CV labeler
+returns θ ≈ +168° instead of θ ≈ +17°. That's the 180° symmetry flip
+in raw form — Δreward = 2 at fixed T pose — and it is what the user
+flagged as the reward-signal noise source to watch.
+
+**MPPI softmax handles it correctly at this state.** The 4 flipped
+candidates sum to weight 0.048 (≈5% of total); the 8 normal candidates
+sum to 0.68 (≈68%). `a*` is pulled toward the normal cluster:
+
+```
+a*        = [+0.066, +0.038, -0.024, -0.023]
+a_naive   = [+0.042, +0.012, -0.028, -0.012]
+||a* - a_naive|| = 0.037
+```
+
+The L2 difference of 0.037 is non-trivial relative to the action scale
+(σ=0.1), so the softmax is actually re-weighting rather than yielding
+the naive mean — good evidence that MPPI search is doing useful work.
+
+### Sampling diversity check (user Step 2 note)
+
+Despite the flip-branch noise, sampling diversity at σ=0.1 looks fine:
+top-8 candidates span Δreward 0.07 (-0.21 to -0.28), Δθ_CV 10° (+11°
+to +21°), and Δcx 2 px. So the top-8 aren't *identical* — the search
+does resolve different trajectories. No evidence σ=0.1 is too
+conservative; keep σ=0.1 for Step 5.
+
+### Wall time
+
+N=16 local plan_step: 5.73 s (close to the 5 s Step 3 projection).
+Cloud N=128 projection remains ~39 s/step.
+
 
 ## Step 5 — Full execution
 (pending)
