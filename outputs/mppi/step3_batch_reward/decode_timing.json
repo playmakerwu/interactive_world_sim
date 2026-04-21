@@ -1,0 +1,8 @@
+{
+  "decode_serial_Nx_s": 1.1693,
+  "decode_batched_N_s": 1.0384,
+  "decode_serial_per_frame_ms": 73.08,
+  "decode_batched_per_frame_ms": 64.9,
+  "decode_batched_speedup": 1.13,
+  "N": 16
+}

@@ -189,6 +189,12 @@ Key findings for Step 3+:
    change in the actual T pose. This is an irreducible reward-signal
    noise source.
 
+   **Watch at Step 5:** if the per-step reward curve shows ±2 sudden
+   jumps during execution, the cause is almost certainly this 180°
+   ambiguity, not a controller failure. Last-step-only reward + softmax
+   should largely contain this (single-trajectory flips dilute in the
+   weighted mean), but a dense-reward v1 upgrade would amplify it.
+
 5. **Wall-time projection is reasonable but not fast.** N=128 per plan
    step ≈ 14 s, implying 50 control steps ≈ 12 minutes per run. Under
    the "v0 diagnostic" budget this is fine. If Step 5 shows per-step
@@ -206,7 +212,90 @@ Key findings for Step 3+:
 
 
 ## Step 3 — Batched reward
-(pending)
+
+### What shipped
+
+- `rl/mppi/reward.py::batched_state_reward(rgb_batch, state_goal, ...)`
+  — accepts `(N, H, W, 3)` numpy (uint8 or float32 [0,1]) OR the
+  `(N, 3, H, W)` float32 [0,1] tensor that `wm.decode` returns directly.
+  Returns `(rewards: np.ndarray (N,), labels: list[CVLabelResult])`.
+  Internally loops CV per-frame — CPU-bound, ~20–25 ms/frame.
+- `rl/mppi/reward.py::score_latents(z_batch, state_goal, wm, ...)` —
+  decode then score in one call. Exact API MPPI's plan_step will use.
+- `tests/mppi/test_sampling.py` — 4 tests. All pass.
+- `scripts/viz_step3_batch_reward.py` — writes
+  `reward_histograms.png`, `decode_timing.json`, `summary.json`.
+
+### Test results
+
+```
+test_batched_reward_shape_and_finite       PASSED
+test_batched_reward_matches_single_loop    PASSED   batched == serial loop
+test_score_latents_end_to_end              PASSED   mean=-0.001 std=0.001 on z_goal
+test_batched_reward_accepts_torch_tensor   PASSED
+```
+
+### Viz observations (N=16, H=10, σ=0.1)
+
+| Start state | mean reward | std   | min   | max   |
+|-------------|-------------|-------|-------|-------|
+| z_goal      | -0.005      | 0.004 | -0.018| -0.001|
+| far (mini ep2 t=0) | -0.778 | 0.824 | -2.200 | -0.208 |
+
+`outputs/mppi/step3_batch_reward/reward_histograms.png` shows the
+expected qualitative shapes: a narrow spike at zero from z_goal, and
+a **bimodal** distribution from the far start — one cluster near -2.2
+(position far AND 180° CV flip), the other near -0.3 (position still
+off but CV got the right orientation). 11/16 samples landed in the
+non-flipped cluster. This is strong confirmation of the §Step 2 noise
+#2 flag: the 180° CV ambiguity produces Δ≈2 discrete jumps in reward
+even when the underlying T pose barely moves (H=10 at σ=0.1 is not
+enough to reorient the T by 180°).
+
+### Batched decode wall time — the user's specific Step 3 ask
+
+```
+  serial × 16:   1.169 s   (73.1 ms/frame)
+  batched N=16:  1.038 s   (64.9 ms/frame)
+  speedup:       1.1×
+```
+
+**This is the key finding for production planning.** Batching gives
+only a ~10% speedup, not the 3–4× we'd hoped for. The IWS diffusion
+decoder is compute-bound (consistency-model denoising + attention
+softmax over spatial tokens dominates), so batching doesn't
+amortize across the parallel dimension the way a pure conv model
+would.
+
+### Per-plan-step wall time projection, revised
+
+| Phase                 | N=16 local (measured) | N=128 cloud (extrapolated) |
+|-----------------------|-----------------------|----------------------------|
+| Rollout               | 3.5–3.8 s             | ~28 s (linear extrap)      |
+| Batched decode        | 1.0 s                 | ~8.3 s (flat 65 ms/frame)  |
+| CV labeling           | 0.6 s                 | ~2.6 s (flat 20 ms/frame)  |
+| **Per plan step**     | **~5 s**              | **~39 s**                  |
+| 50-step execution     | ~4 min                | ~32 min                    |
+
+The N=128 cloud projection is worse than the Step 2 naïve estimate
+(14 s/step → 12 min/run). If the actual cloud number is in this
+ballpark, Step 5 cloud runs will take ~30–60 minutes each.
+
+If that's too slow, the cheapest mitigation is to drop N. Going
+N=128 → N=64 halves the rollout cost and roughly halves the decode
+cost, bringing per-step to ~20 s and per-run to ~15 min. Flagged
+for Step 5 decision after first cloud run.
+
+### Local N-limit decision
+
+N=32 in Step 1 fit in 5.5 GiB because it was rollout-only. Step 3
+adds batched decode, which needs ~4 GiB of attention-softmax scratch
+on top of the ~5 GiB already held by rollout + WM params. Total
+~9.5 GiB overruns the ~9.4 GiB effectively-available local pool
+(fragmentation included). Dropped to N=16 locally; cloud re-runs
+the same script at N=64 or N=128 to get the full-distribution
+histogram. No decode chunking added — explicitly out of scope per
+Step 1 feedback.
 
 ## Step 4 — Single plan step
 (pending)
