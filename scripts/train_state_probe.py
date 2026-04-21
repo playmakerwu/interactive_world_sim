@@ -58,8 +58,8 @@ LR = 3e-4
 WD = 1e-4
 WARMUP_STEPS = 500
 MIN_EPOCHS = 20
-MAX_EPOCHS = 100
-PATIENCE = 10
+MAX_EPOCHS = 200
+PATIENCE = 10000  # diagnostic run: disable early stop, let MAX_EPOCHS decide
 GRAD_CLIP = 1.0
 SEED = 0
 
