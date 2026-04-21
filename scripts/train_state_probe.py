@@ -50,7 +50,7 @@ DEVICE = "cuda:0"
 # Loss / reward weights (design doc §1.7)
 LAMBDA_POS = 7.0
 LAMBDA_ANG = 1.0
-LAMBDA_NORM = 0.01
+LAMBDA_NORM = 0.1
 
 # Training config (design doc §1.8)
 BATCH_SIZE = 16
