@@ -45,7 +45,7 @@ from rl.models.world_model import DifferentiableDynamics  # noqa: E402
 
 # Constants
 CKPT_PATH = REPO_ROOT / "outputs" / "pusht_cam1" / "checkpoints" / "best.ckpt"
-DATA_ROOT = REPO_ROOT / "data" / "mini" / "pusht"
+DATA_ROOT = REPO_ROOT / "data" / "full" / "pusht"
 OUT_DIR = REPO_ROOT / "outputs" / "state_probe" / "labels"
 
 PRESET = "REAL"

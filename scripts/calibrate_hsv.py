@@ -60,7 +60,7 @@ from rl.models.world_model import DifferentiableDynamics  # noqa: E402
 from rl.visualization.state_viz import render_state_on_image  # noqa: E402
 
 CKPT_PATH = REPO_ROOT / "outputs" / "pusht_cam1" / "checkpoints" / "best.ckpt"
-TRAIN_DIR = REPO_ROOT / "data" / "mini" / "pusht" / "train"
+TRAIN_DIR = REPO_ROOT / "data" / "full" / "pusht" / "train"
 OUT_DIR = REPO_ROOT / "tests" / "state_estimator" / "calibration_outputs"
 
 RESOLUTION = 128
