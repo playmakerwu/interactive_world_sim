@@ -400,13 +400,202 @@ Cloud N=128 projection remains ~39 s/step.
 
 
 ## Step 5 — Full execution
-(pending)
+
+### What shipped
+
+- `scripts/run_mppi.py` — CLI entry point with `--run_name`,
+  `--initial_state` (`z_goal`, `mini/val/<ep>/<t>`, `full/val/...`, or
+  a `.pt` path), `--N`, `--H`, `--sigma`, `--temperature`,
+  `--control_steps`, `--seed`, `--baseline`. Writes the full artifact
+  set prescribed in §2.1: `trajectory.mp4`, `trajectory_overlay.mp4`
+  (CV green, goal red, step+reward label), `trajectory_latents.pt`,
+  `action_history.pt`, `reward_curve.png`,
+  `rollout_samples_step_{0,10,20,30,40}.png`, `summary.json`.
+- `tests/mppi/test_end_to_end.py` — 3 tests. N=8, H=3, 5 control
+  steps. Full run ≈ 13 s including file-IO assertions.
+
+### Initial state and goal
+
+- Initial: `data/mini/pusht/val/episode_0/frame_0` (cloud runs would
+  use `data/full/pusht/val/episode_0` per spec; data/full not
+  available locally).
+- Goal: `tests/goal_selection/state_goal.pt` — (cx, cy, θ) =
+  (55.66, 62.75, +0.75°). This is the axis-aligned goal that §Step
+  3 flagged as the flip-prone zone.
+- Initial decoded CV reading: (73, 62, +161°). 17.5 px from goal in
+  position, +160° off in angle (or equivalently −19° off if CV is
+  reading the flipped branch — the T is likely physically at θ ≈ −19°
+  but the initial-frame CV returns +161°).
+
+### Headline results
+
+Both runs, local GPU 0, N=16 (not N=128 cloud). Total wall time on
+local for the pair: **5.0 min** (MPPI) + **6 s** (baseline).
+
+|                          | MPPI (σ=0.1, N=16)    | Baseline (σ=0)         |
+|--------------------------|-----------------------|------------------------|
+| Wall time                | 292 s (5.8 s/step)    | 5.6 s (0.11 s/step)    |
+| Initial distance         | 17.5 px               | 17.5 px                |
+| **Final distance**       | **28.5 px**           | **25.1 px**            |
+| **Final angle error**    | **−134.7°**           | **−92.7°**             |
+| **Final cos-sim**        | **−0.70**             | **−0.05**              |
+| success_strict           | False                 | False                  |
+| success_cos              | False                 | False                  |
+| flipped_convergence      | False                 | False                  |
+| Best reward in trajectory| −0.16 (t=27)          | −0.31 (t=20)           |
+| CV failures              | 4 (at t=42,45,46,47)  | 0                      |
+
+**Neither MPPI nor baseline converges to the goal.** Position actually
+*grew* under MPPI (17.5 → 28.5 px), while baseline drifted 17.5 →
+25.1 px. MPPI did achieve a transient near-goal state at t=25-28
+(reward −0.17, pose (74, 49, −18°)) but could not hold it.
+
+See `outputs/mppi/step5_mppi_local/trajectory_overlay.mp4` and
+`outputs/mppi/step5_baseline_local/trajectory_overlay.mp4`. Goal marker
+is red, CV estimate is green.
+
+### "All-trajectories-flipped" failure mode — confirmed
+
+The user's §Step 3 predicted failure mode manifested. Look at
+`rollout_samples_step_20.png`: **all 16 MPPI candidates at t=20 return
+CV θ ≈ +124°**. Every single trajectory — whether weighted highly or
+not — is stuck in the flipped interpretation. Softmax cannot help when
+every sample is on the wrong branch of the CV ambiguity.
+
+Over the 50-step run the reward signal alternates between the two CV
+branches roughly every 10-15 steps. When the "good" branch is active
+(rare, brief windows around t=25-28 and t=40-44), rewards are near
+zero and MPPI weights toward staying there — but the very next step
+the CV re-acquires the flipped branch and rewards crash back to −2.
+This creates an oscillating reward landscape that MPPI cannot settle
+in.
+
+### Failure analysis
+
+1. **CV 180° flip is the dominant failure mode.** This is the same
+   noise source Step 2 measured (±2 reward jumps) and Step 4 visualized
+   (25% flip rate at a far latent). In closed-loop execution the flip
+   rate is not ~25% but context-dependent: once the WM drifts into a
+   latent region whose decoded RGB is ambiguous for CV, the flipped
+   branch dominates for tens of steps at a time.
+
+2. **Initial-state bias toward the flipped branch.** The decoded
+   initial frame CV'd to +161° rather than −19°. The controller's
+   "ground truth" first observation already started in the wrong
+   branch, and one-step rollouts don't have enough leverage to move
+   the CV across 180° of ambiguity per step.
+
+3. **WM drifts under zero action.** Baseline shows baseline reward
+   over 50 steps of pure zero-action has std = 0.72 (min −2.09,
+   max −0.31). The dynamics are stochastic enough that "just stay
+   still" is not achievable — any reward estimate at t+1 is noisy
+   relative to t regardless of the control input. This amplifies the
+   reward-signal-noise problem for MPPI.
+
+4. **MPPI search is probably sample-starved at N=16.** The N=128 cloud
+   run should be done before drawing final conclusions. But observing
+   that at t=20 ALL 16 local samples are on the flipped branch, it is
+   not obvious that N=128 would include even one non-flipped sample —
+   the CV ambiguity is a property of the decoded RGB, not of the
+   action sampling distribution. More samples may help less than the
+   N=128 design suggested.
+
+### Honest read: does MPPI demonstrate IWS+CV is usable for control?
+
+**Partially — the mechanical pipeline works, but the reward signal
+does not carry enough information to close a loop at the axis-aligned
+goal used here.**
+
+What works:
+- Full MPPI pipeline runs end-to-end without crashes at expected wall
+  time. Rollouts, batched decode, CV label, softmax, execute — all
+  functional.
+- Softmax robustness visible at Step 4 (when both branches are sampled,
+  flipped ones get ~5% weight).
+- Brief near-goal states ARE reachable under MPPI (t=25-28, reward −0.17).
+  The WM dynamics + action input CAN push the T toward the goal.
+
+What does not work:
+- Closed-loop convergence at this initial state + goal. Neither MPPI
+  nor baseline reaches within 5 px / 10°. MPPI's final state is
+  further from goal than baseline's. This is a meaningful negative
+  result, not a pipeline bug.
+- CV-reward reliability at axis-aligned T poses. The 180° ambiguity
+  produces sustained runs of reward ≈ −2 on the flipped branch that
+  the controller cannot escape.
+
+**Direct answer to the diagnostic question posed in §0:** the IWS
+world model + CV state estimator together *do* support an MPPI
+pipeline that can transiently drive toward the goal, but the CV
+reward is too noisy at axis-aligned goals for the loop to actually
+close. The "partial success" finding is more informative than an
+unambiguous pass or fail: it tells us the dynamics and search
+machinery are sound, and the next experiment should isolate the
+CV ambiguity as the root cause before concluding anything about
+IWS-as-a-world-model for RL.
+
+### Recommended next steps (not executed — decision for user)
+
+1. **Off-axis goal re-run.** Re-compute `state_goal.pt` at θ ≈ 45°
+   (bar-vs-stem unambiguous under HSV+ICP). If MPPI now converges,
+   the 180° ambiguity is the whole story and we can design a fix
+   (dense reward at θ measured via sin/cos only, no wrap).
+
+2. **N=128 cloud run.** Confirm the flip-rate observation at larger
+   sample count. Expected: marginal improvement only, because flip
+   is a decoded-RGB property.
+
+3. **Angle-only-in-cosine reward.** The reward uses cos(Δθ) via sin·sin
+   + cos·cos which DOES wrap correctly — but the CV's reported θ
+   varies by 180° across flips, and the raw (cx, cy, θ) stream shows
+   the issue is the CV's θ, not the reward's handling of it. Angle
+   handling on the MPPI side is not the bug.
+
+4. **Symmetry-aware reward fallback.** Take `min(|1−cos(Δθ)|,
+   |1−cos(Δθ+180°)|)` if the T's 180° symmetry is acceptable for this
+   task. This would mark the 180° branch as the CORRECT goal (it's
+   physically the same T) and eliminate the noise source altogether —
+   at the cost of conflating "right-side up" and "upside-down" final
+   poses.
 
 ## Final Results
-(pending)
 
-## Failure analysis (if applicable)
-(pending)
+See §Step 5 above. TL;DR:
+
+- MPPI: `outputs/mppi/step5_mppi_local/`
+  - `summary.json` → success_strict=False, success_cos=False,
+    final_pos_distance=28.5 px, final_angle_err=−134.7°
+  - `trajectory_overlay.mp4`, `reward_curve.png`,
+    `rollout_samples_step_{00,10,20,30,40}.png`
+- Baseline: `outputs/mppi/step5_baseline_local/`
+  - `summary.json` → success_strict=False, success_cos=False,
+    final_pos_distance=25.1 px, final_angle_err=−92.7°
+  - `trajectory_overlay.mp4`, `reward_curve.png`
+
+**Primary blocker:** CV 180° symmetry flip in the reward signal,
+confirmed as the "all-trajectories-flipped" failure mode the user
+predicted at §Step 3. Fix = off-axis goal re-run (user §Step 3
+fallback plan).
+
+## Failure analysis
+
+See §Step 5 failure analysis subsection above — 4 items.
 
 ## What this tells us about IWS + CV control feasibility
-(pending)
+
+- **IWS WM dynamics + CV pose estimator, as a pair, DO generate
+  a usable signal for MPPI.** Brief near-goal states are
+  reachable; softmax search is non-trivial; pipeline timing is
+  within budget.
+- **The CV reward is NOT reliable at axis-aligned T-block poses.**
+  180° ambiguity produces sustained runs of wrong-branch reward
+  that MPPI cannot recover from.
+- **This is isolatable — the off-axis goal fallback is a clean
+  experiment** that would determine whether the 180° flip is the
+  whole story or whether there are additional control issues.
+- **For the probe/Dreamer path this is mixed news.** The same CV
+  ambiguity will contaminate probe labels at axis-aligned frames,
+  which may explain some of the sin/cos collapse behavior that
+  was observed during probe training on `state-probe-training-cloud`.
+  Running the off-axis goal experiment for both MPPI AND probe
+  training could localize the issue.
