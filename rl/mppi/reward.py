@@ -3,14 +3,33 @@
 Scores a single RGB image against a T-block state goal using the classical CV
 labeler (rl.labeling.cv_labeler). Reward is:
 
-    R = -||pos - pos_goal|| / image_diagonal  -  |1 - cos(theta - theta_goal)|
+    R = -||pos - pos_goal|| / image_diagonal  -  angle_penalty
 
 with a large-magnitude penalty when CV fails, so off-distribution rollouts are
 pushed away without being confused with merely "far from goal".
 
+Two angle-penalty variants are available:
+
+  (1) default (symmetry_aware=False):
+          angle_penalty = |1 - cos(Δθ)|      in [0, 2]
+      Penalizes orientation error monotonically, with 180° = worst case.
+
+  (2) symmetry_aware=True:
+          angle_penalty = 1 - |cos(Δθ)|      in [0, 1]
+      Treats θ and θ+180° as equivalent. Chosen for the PushT task where
+      the T-block is 180°-symmetric for pushing purposes (bar+stem
+      geometry is the same when flipped). This neutralizes the 180° CV
+      ambiguity that dominates the axis-aligned-goal failure from Step 5.
+
+      Note the range is tighter: angle penalty is capped at 1, not 2, so
+      the position term has effectively 2× the influence it did under the
+      default variant. We are not rescaling position — position
+      convergence is the primary task objective, and the whole point of
+      symmetry-aware is to not over-punish a flipped-but-correct pose.
+
 The angle term uses the sin-cos dot product identity:
     sin(a)*sin(b) + cos(a)*cos(b) = cos(a - b)
-so |1 - cos(delta_theta)| is computed directly from the label's sin_theta /
+so the angle penalty is computed directly from the label's sin_theta /
 cos_theta — we never call atan2.
 """
 
@@ -39,6 +58,7 @@ def state_reward(
     labeler: CVLabeler | None = None,
     image_diagonal: float = IMAGE_DIAGONAL_128,
     large_penalty: float = DEFAULT_LARGE_PENALTY,
+    symmetry_aware: bool = False,
 ) -> tuple[float, CVLabelResult]:
     """Reward one RGB against a state goal.
 
@@ -55,6 +75,8 @@ def state_reward(
         large_penalty: returned when CV detection fails. Should be much
             more negative than any typical reward so failures visibly
             dominate the softmax.
+        symmetry_aware: if True, angle penalty = 1 - |cos(Δθ)| so that
+            θ and θ+180° score equally. See module docstring.
 
     Returns:
         (reward: float, label: CVLabelResult). The label is exposed so
@@ -79,7 +101,10 @@ def state_reward(
     )
     # clamp to [-1, 1] before the subtract to guard against tiny FP > 1.
     cos_delta = max(-1.0, min(1.0, cos_delta))
-    ang_term = -abs(1.0 - cos_delta)
+    if symmetry_aware:
+        ang_term = -(1.0 - abs(cos_delta))
+    else:
+        ang_term = -abs(1.0 - cos_delta)
 
     reward = pos_term + ang_term
     return reward, label
@@ -92,6 +117,7 @@ def batched_state_reward(
     labeler: CVLabeler | None = None,
     image_diagonal: float = IMAGE_DIAGONAL_128,
     large_penalty: float = DEFAULT_LARGE_PENALTY,
+    symmetry_aware: bool = False,
 ) -> tuple[np.ndarray, list[CVLabelResult]]:
     """Reward for a batch of RGB frames against a state goal.
 
@@ -134,6 +160,7 @@ def batched_state_reward(
             labeler=labeler,
             image_diagonal=image_diagonal,
             large_penalty=large_penalty,
+            symmetry_aware=symmetry_aware,
         )
         rewards[i] = r
         labels.append(label)
@@ -149,6 +176,7 @@ def score_latents(
     resolution: int = 128,
     image_diagonal: float = IMAGE_DIAGONAL_128,
     large_penalty: float = DEFAULT_LARGE_PENALTY,
+    symmetry_aware: bool = False,
 ) -> tuple[np.ndarray, list[CVLabelResult]]:
     """Decode a batch of latents through the WM, then score each RGB.
 
@@ -178,4 +206,5 @@ def score_latents(
         labeler=labeler,
         image_diagonal=image_diagonal,
         large_penalty=large_penalty,
+        symmetry_aware=symmetry_aware,
     )

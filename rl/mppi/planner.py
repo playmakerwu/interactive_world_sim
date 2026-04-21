@@ -60,6 +60,7 @@ class MPPIPlanner:
         resolution: int = 128,
         image_diagonal: float = IMAGE_DIAGONAL_128,
         large_penalty: float = DEFAULT_LARGE_PENALTY,
+        symmetry_aware: bool = False,
         labeler: CVLabeler | None = None,
         device: str = "cuda:0",
         capture_rgb: bool = False,
@@ -74,6 +75,7 @@ class MPPIPlanner:
         self.resolution = resolution
         self.image_diagonal = image_diagonal
         self.large_penalty = large_penalty
+        self.symmetry_aware = symmetry_aware
         self.labeler = labeler or CVLabeler(preset="REAL", resolution=resolution)
         if self.labeler.resolution != resolution:
             raise ValueError(
@@ -149,6 +151,7 @@ class MPPIPlanner:
             labeler=self.labeler,
             image_diagonal=self.image_diagonal,
             large_penalty=self.large_penalty,
+            symmetry_aware=self.symmetry_aware,
         )
         cv_fail_count = sum(1 for lbl in labels if not lbl.success)
 

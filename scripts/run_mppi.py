@@ -192,8 +192,18 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--run_name", required=True)
     ap.add_argument("--initial_state", default="mini/val/0/0")
+    ap.add_argument(
+        "--goal_path",
+        default=str(STATE_GOAL_PATH.relative_to(REPO_ROOT)),
+        help="Path to a state_goal .pt (same schema as tests/goal_selection/state_goal.pt)",
+    )
     ap.add_argument("--baseline", action="store_true",
                     help="Zero-action control (no sampling, no search)")
+    ap.add_argument(
+        "--symmetry_aware", action="store_true",
+        help="Use the symmetry-aware angle penalty (1 - |cos Δθ|). "
+             "Treats θ and θ+180° as equivalent. Default: False.",
+    )
     ap.add_argument("--N", type=int, default=16)
     ap.add_argument("--H", type=int, default=10)
     ap.add_argument("--sigma", type=float, default=0.1)
@@ -212,7 +222,11 @@ def main() -> None:
     print(f"Loading WM from {CKPT_PATH}")
     wm = DifferentiableDynamics(str(CKPT_PATH), device=device)
 
-    g = torch.load(STATE_GOAL_PATH, map_location="cpu")
+    goal_path = Path(args.goal_path)
+    if not goal_path.is_absolute():
+        goal_path = REPO_ROOT / goal_path
+    print(f"Loading state_goal from {goal_path}")
+    g = torch.load(goal_path, map_location="cpu")
     state_goal = {
         "cx": g["cx"], "cy": g["cy"],
         "sin_theta": g["sin_theta"], "cos_theta": g["cos_theta"],
@@ -226,12 +240,17 @@ def main() -> None:
         z_current = z_current.unsqueeze(0)
     assert z_current.shape == (1, 4, 32, 32)
 
-    # Record the initial (decoded) frame + label.
+    # Record the initial (decoded) frame + label. Initial reward uses
+    # the SAME reward variant as the controller so the recorded
+    # reward_curve is directly comparable across runs.
     with torch.no_grad():
         rgb0 = wm.decode(z_current, resolution=RES)
     rgb0_u8 = (rgb0.clamp(0, 1).cpu().numpy()[0] * 255).astype(np.uint8)
     rgb0_u8 = rgb0_u8.transpose(1, 2, 0)
-    r0, lbl0 = state_reward(rgb0_u8, state_goal, labeler=labeler)
+    r0, lbl0 = state_reward(
+        rgb0_u8, state_goal, labeler=labeler,
+        symmetry_aware=args.symmetry_aware,
+    )
 
     trajectory_latents: list[torch.Tensor] = [z_current[0].cpu().clone()]
     action_history: list[torch.Tensor] = []
@@ -255,6 +274,7 @@ def main() -> None:
             wm, state_goal,
             N=args.N, H=args.H, sigma=args.sigma, temperature=args.temperature,
             action_dim=args.action_dim, resolution=RES, device=device,
+            symmetry_aware=args.symmetry_aware,
             labeler=labeler,
             capture_rgb=True,  # snapshots at specific steps
         )
@@ -293,7 +313,10 @@ def main() -> None:
             rgb_t = wm.decode(z_current, resolution=RES)
         rgb_t_u8 = (rgb_t.clamp(0, 1).cpu().numpy()[0] * 255).astype(np.uint8)
         rgb_t_u8 = rgb_t_u8.transpose(1, 2, 0)
-        r_t, lbl_t = state_reward(rgb_t_u8, state_goal, labeler=labeler)
+        r_t, lbl_t = state_reward(
+            rgb_t_u8, state_goal, labeler=labeler,
+            symmetry_aware=args.symmetry_aware,
+        )
 
         plan_s = time.time() - plan_t0
 
@@ -387,6 +410,8 @@ def main() -> None:
         "config": {
             "mode": "baseline" if args.baseline else "mppi",
             "initial_state": args.initial_state,
+            "goal_path": str(goal_path.relative_to(REPO_ROOT)) if goal_path.is_relative_to(REPO_ROOT) else str(goal_path),
+            "symmetry_aware": bool(args.symmetry_aware),
             "N": args.N, "H": args.H, "sigma": args.sigma,
             "temperature": args.temperature, "seed": args.seed,
             "control_steps": args.control_steps,
