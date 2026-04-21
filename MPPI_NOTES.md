@@ -599,3 +599,135 @@ See §Step 5 failure analysis subsection above — 4 items.
   was observed during probe training on `state-probe-training-cloud`.
   Running the off-axis goal experiment for both MPPI AND probe
   training could localize the issue.
+
+## § Symmetry-aware + Off-axis Follow-up (Step 5 post-mortem runs)
+
+Three diagnostic runs executed locally to validate (or falsify) the
+§Step 5 "180° CV flip is the dominant failure" hypothesis. Same N=16,
+H=10, σ=0.1, 50 control steps, seed=0, initial state mini/val/0/0
+across all three. Only the reward variant and goal change.
+
+| Run | Reward        | Goal θ   | Final pos (px) | Final ∣Δθ∣ (deg) | cos-sim | CV fails | Reward range | Success? |
+|-----|---------------|----------|----------------|------------------|---------|----------|--------------|----------|
+| v1  | original      | +0.8°    | 28.51          | 134.70           | -0.70   | 4        | [-10, -0.16] | False    |
+| v2  | sym-aware     | +0.8°    | **11.90**      | 64.17            | +0.44   | **0**    | [-1.00, -0.09]| False   |
+| v3  | sym-aware     | -32.7°   | 14.62          | 100.34           | -0.18   | 0        | [-1.07, -0.09]| False   |
+
+### Per-run read
+
+**v1 (baseline, committed at §Step 5):** 180° CV flip dominated. All
+16 trajectories spent t=2–24 stuck in the flipped branch at reward ≈
+-2. Brief transient near-goal state at t=25–28 then lost. 4 CV
+failures during the run. Final position 28.5 px, angle -134.7° off.
+This is the failure mode we went on to mitigate.
+
+**v2 (sym-aware + same axis-aligned goal):** major improvement, not a
+cure. Sym-aware eliminates the 180° catastrophe entirely:
+reward_curve bounded in [-1, -0.09] (no -2 spikes, no -10 CV-fail
+spikes), 0 CV failures, final position 11.9 px (≈58% closer than v1),
+cos-sim +0.44. But the controller still can't close the last gap.
+Peak reward -0.087 reached at t=27, not held; trajectory settles
+into angular oscillation around ±60° instead of converging to
++1°.
+
+**v3 (sym-aware + off-axis goal at -32.7°):** same qualitative result
+as v2, not the clean win we'd hoped for. Position 14.6 px at end,
+angle 100° off, cos-sim -0.18. Does touch near-goal
+transiently (t=5: r=-0.16, t=10: r=-0.10, t=20: r=-0.126 at pose
+(76, 53, -40°) — very close to the -33° goal angle).
+
+Then at t=25 the trajectory switched to a different attractor at
+(70, 58, +52°), reward ≈ -1, and stayed there for the remaining
+25 steps with minor drift.
+
+### Honest read
+
+**v1 → v2 is a dramatic improvement.** The 180° symmetry flip WAS a
+real, measurable failure mode, and symmetry-aware reward fixes it
+cleanly:
+- Final position halved (28.5 → 11.9 px)
+- CV failure count 4 → 0
+- Reward range narrows from [-10, -0.16] to [-1.0, -0.09]
+- All catastrophic -10 spikes (CV off-distribution) gone
+- Sustained reward-trajectory plateau around -2 (flip branch) gone
+
+But v2 and v3 both fail to converge, and they fail in the same way.
+The controller finds near-goal states transiently but settles into
+off-goal attractors. **There is a second failure mode beyond the
+180° flip.** Candidates for what it is:
+
+1. **Stochastic WM attractors.** The consistency-model decoder
+   produces noisy latents with a few preferred modes. σ=0.1 actions
+   may not have enough authority to nudge the latent out of an
+   off-goal attractor in a single step. Strong candidate given the
+   v1 baseline also showed similar oscillation.
+
+2. **N=16 too small.** The §Step 3 decision to keep N=128 for cloud
+   was specifically because smaller N reduces search quality.
+   Locally we are running at 12% of intended sample count. A cloud
+   N=128 v2/v3 re-run would test this.
+
+3. **Planning horizon too short.** H=10 may not be enough for the
+   controller to "see" that it should commit to the near-goal
+   attractor. MPPI rolls out H=10 steps and scores the final; if the
+   WM briefly visits near-goal at t=5 of a candidate then drifts
+   away, the final-step reward won't reflect the transient.
+
+4. **Greedy softmax with no persistence.** At each step MPPI picks a*
+   independently with no memory of the previous plan. Even if t=20
+   found a great action, t=21 starts over. Warm-start (carry the
+   previous-step optimal sequence) is the classic fix and is listed
+   as a v1 feature in the original spec.
+
+### Implication for the paused probe training
+
+The v2 result is **very good news for the probe path**:
+
+- If the probe was trained on axis-aligned frames from the full
+  dataset, it would see the same 180° CV flip contamination in its
+  labels (θ and θ+180° both mapped to the same visual T). This
+  would manifest as the sin/cos collapse observed during probe
+  training on `state-probe-training-cloud`.
+- **Adding symmetry-aware handling to probe training** (predict
+  `|sin(2θ)|, |cos(2θ)|` or use a squared-trig loss) might fix the
+  collapse the same way it fixed MPPI's v1 pathology. Unified story:
+  the CV labels have a 180° redundancy, any downstream consumer
+  that treats θ and θ+180° as different will get noisy gradients.
+
+This is hypothetical and needs a follow-up experiment. But if the
+user wants to re-open the probe path, symmetry-aware labels is a
+concrete first thing to try.
+
+### Artifacts
+
+- v1 (baseline-flavored MPPI): [outputs/mppi/step5_mppi_local/](outputs/mppi/step5_mppi_local/)
+  - [trajectory_overlay.mp4](outputs/mppi/step5_mppi_local/trajectory_overlay.mp4)
+  - [reward_curve.png](outputs/mppi/step5_mppi_local/reward_curve.png)
+  - [summary.json](outputs/mppi/step5_mppi_local/summary.json)
+- v2 (sym-aware + axis-aligned): [outputs/mppi/step5_v2_symaware_axisaligned/](outputs/mppi/step5_v2_symaware_axisaligned/)
+  - [trajectory_overlay.mp4](outputs/mppi/step5_v2_symaware_axisaligned/trajectory_overlay.mp4)
+  - [reward_curve.png](outputs/mppi/step5_v2_symaware_axisaligned/reward_curve.png)
+  - [summary.json](outputs/mppi/step5_v2_symaware_axisaligned/summary.json)
+- v3 (sym-aware + off-axis): [outputs/mppi/step5_v3_symaware_offaxis/](outputs/mppi/step5_v3_symaware_offaxis/)
+  - [trajectory_overlay.mp4](outputs/mppi/step5_v3_symaware_offaxis/trajectory_overlay.mp4)
+  - [reward_curve.png](outputs/mppi/step5_v3_symaware_offaxis/reward_curve.png)
+  - [summary.json](outputs/mppi/step5_v3_symaware_offaxis/summary.json)
+- Off-axis goal artifacts:
+  - [tests/goal_selection/state_goal_offaxis.pt](tests/goal_selection/state_goal_offaxis.pt) — (62.59, 69.87, -32.66°)
+  - [tests/goal_selection/state_goal_offaxis_overlay.png](tests/goal_selection/state_goal_offaxis_overlay.png)
+  - Picked from mini/val/episode_4 t=60, icp_residual 0.539
+
+### Recommended next steps (not executed)
+
+1. **Cloud N=128 re-run of v2 and v3.** The single most informative
+   experiment: if N=128 v2 converges where N=16 v2 didn't, sampling
+   density is the missing ingredient. If N=128 v2 still can't hold
+   near-goal, the WM attractor hypothesis is the real blocker and
+   no amount of sampling will help.
+2. **Warm-start MPPI.** Cheap change (carry a*[0..H-2] as the mean
+   for the next step's sampling distribution) that gives the
+   controller persistence between steps.
+3. **Symmetry-aware probe training.** Re-open the paused probe path
+   with `|sin(2θ)|, |cos(2θ)|` labels and see if the sin/cos
+   collapse resolves. If it does, the whole PushT stack has a
+   unified "180° symmetry causes gradient noise" story.
