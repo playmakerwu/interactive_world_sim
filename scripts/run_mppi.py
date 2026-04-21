@@ -37,6 +37,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from rl.labeling.cv_labeler import CVLabeler  # noqa: E402
 from rl.models.world_model import DifferentiableDynamics  # noqa: E402
+from rl.mppi.action_sampling import (  # noqa: E402
+    DemoChunkJitterSampler,
+    DemoChunkSampler,
+    GaussianSampler,
+)
 from rl.mppi.planner import MPPIPlanner  # noqa: E402
 from rl.mppi.reward import (  # noqa: E402
     DEFAULT_LARGE_PENALTY,
@@ -211,6 +216,25 @@ def main() -> None:
     ap.add_argument("--control_steps", type=int, default=50)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--action_dim", type=int, default=4)
+    ap.add_argument(
+        "--action_source",
+        choices=["gaussian", "demo", "demo_jitter"],
+        default="gaussian",
+        help="Action sampling distribution. 'gaussian' = zero-mean randn*sigma "
+             "(v0 default, catastrophically OOD for IWS WM). 'demo' = draw length-H "
+             "slices directly from the train action bank. 'demo_jitter' = same as "
+             "'demo' plus per-step Gaussian noise at --jitter_sigma.",
+    )
+    ap.add_argument(
+        "--demo_train_dir",
+        default="data/mini/pusht/train",
+        help="Directory of training episodes to build the demo action bank from.",
+    )
+    ap.add_argument(
+        "--jitter_sigma", type=float, default=0.01,
+        help="Per-step Gaussian jitter added on top of demo chunks in "
+             "'demo_jitter' mode. Small vs demo step-to-step delta ≈ 0.012.",
+    )
     args = ap.parse_args()
 
     device = "cuda:0"
@@ -270,11 +294,25 @@ def main() -> None:
     # ------------ planner or baseline setup ------------
     planner: MPPIPlanner | None = None
     if not args.baseline:
+        demo_dir = REPO_ROOT / args.demo_train_dir
+        if args.action_source == "gaussian":
+            action_sampler = GaussianSampler(sigma=args.sigma, action_dim=args.action_dim)
+        elif args.action_source == "demo":
+            action_sampler = DemoChunkSampler(train_dir=demo_dir)
+        elif args.action_source == "demo_jitter":
+            action_sampler = DemoChunkJitterSampler(
+                train_dir=demo_dir, jitter_sigma=args.jitter_sigma,
+            )
+        else:
+            raise AssertionError(args.action_source)
+        print(f"Action sampler: {action_sampler}")
+
         planner = MPPIPlanner(
             wm, state_goal,
             N=args.N, H=args.H, sigma=args.sigma, temperature=args.temperature,
             action_dim=args.action_dim, resolution=RES, device=device,
             symmetry_aware=args.symmetry_aware,
+            action_sampler=action_sampler,
             labeler=labeler,
             capture_rgb=True,  # snapshots at specific steps
         )
@@ -412,6 +450,8 @@ def main() -> None:
             "initial_state": args.initial_state,
             "goal_path": str(goal_path.relative_to(REPO_ROOT)) if goal_path.is_relative_to(REPO_ROOT) else str(goal_path),
             "symmetry_aware": bool(args.symmetry_aware),
+            "action_source": args.action_source,
+            "jitter_sigma": args.jitter_sigma if args.action_source == "demo_jitter" else None,
             "N": args.N, "H": args.H, "sigma": args.sigma,
             "temperature": args.temperature, "seed": args.seed,
             "control_steps": args.control_steps,

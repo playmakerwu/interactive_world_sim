@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 from rl.labeling.cv_labeler import CVLabeler, CVLabelResult
+from rl.mppi.action_sampling import ActionSampler, GaussianSampler
 from rl.mppi.reward import (
     DEFAULT_LARGE_PENALTY,
     IMAGE_DIAGONAL_128,
@@ -61,6 +62,7 @@ class MPPIPlanner:
         image_diagonal: float = IMAGE_DIAGONAL_128,
         large_penalty: float = DEFAULT_LARGE_PENALTY,
         symmetry_aware: bool = False,
+        action_sampler: ActionSampler | None = None,
         labeler: CVLabeler | None = None,
         device: str = "cuda:0",
         capture_rgb: bool = False,
@@ -76,6 +78,14 @@ class MPPIPlanner:
         self.image_diagonal = image_diagonal
         self.large_penalty = large_penalty
         self.symmetry_aware = symmetry_aware
+        self.action_sampler: ActionSampler = action_sampler or GaussianSampler(
+            sigma=sigma, action_dim=action_dim
+        )
+        if self.action_sampler.action_dim != action_dim:
+            raise ValueError(
+                f"action_sampler.action_dim={self.action_sampler.action_dim} "
+                f"!= planner action_dim={action_dim}"
+            )
         self.labeler = labeler or CVLabeler(preset="REAL", resolution=resolution)
         if self.labeler.resolution != resolution:
             raise ValueError(
@@ -86,8 +96,7 @@ class MPPIPlanner:
         self.last_stats: PlanStepStats | None = None
 
     def _sample_actions(self) -> torch.Tensor:
-        shape = (self.N, self.H, self.action_dim)
-        return torch.randn(shape, device=self.device) * self.sigma
+        return self.action_sampler.sample(self.N, self.H, self.device)
 
     def plan_step(
         self,
