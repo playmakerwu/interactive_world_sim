@@ -276,6 +276,9 @@ def main() -> None:
     if z_current.dim() == 3:
         z_current = z_current.unsqueeze(0)
     assert z_current.shape == (1, 4, 32, 32)
+    # Snapshot before the main loop overwrites z_current. Saved for
+    # downstream tools (scripts/wm_interactive_replay.py).
+    z_initial_snapshot = z_current.detach().cpu().clone()
 
     # Record the initial (decoded) frame + label. Initial reward uses
     # the SAME reward variant as the controller so the recorded
@@ -398,6 +401,10 @@ def main() -> None:
     # ------------ save artifacts ------------
     torch.save(torch.stack(trajectory_latents), out_dir / "trajectory_latents.pt")
     torch.save(torch.stack(action_history), out_dir / "action_history.pt")
+    # Persist the initial latent (snapshot taken before the loop) so
+    # downstream tools (e.g. scripts/wm_interactive_replay.py) can load
+    # it without parsing the full trajectory tensor.
+    torch.save(z_initial_snapshot, out_dir / "initial_latent.pt")
 
     _write_mp4(frames_rgb, out_dir / "trajectory.mp4")
     _write_mp4(overlays, out_dir / "trajectory_overlay.mp4")
