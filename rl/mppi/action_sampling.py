@@ -90,6 +90,39 @@ class DemoChunkSampler:
         )
 
 
+class KeyboardAtomSampler:
+    """Sample one of 9 keyboard atoms per step: noop + 8 axis-aligned deltas
+    of magnitude 0.02, exactly matching the PushT keyboard teleop
+    (`rl/discrete_action_space.json`).
+
+    Intended for use with the planner's accumulator mode: the sampled
+    deltas are cumulatively summed from the current `curr_action`, then
+    clamped to [-1, 1]. The WM sees the *running sum*, not the delta —
+    identical to what `teleoperate_keyboard.py` feeds the WM during a
+    human play session.
+    """
+
+    def __init__(self, atom_magnitude: float = 0.02, action_dim: int = 4) -> None:
+        self.atom_magnitude = atom_magnitude
+        self.action_dim = action_dim
+        m = atom_magnitude
+        self._atoms = torch.tensor([
+            [0, 0, 0, 0],
+            [0, 0, -m, 0], [0, 0, +m, 0],
+            [0, 0, 0, -m], [0, 0, 0, +m],
+            [-m, 0, 0, 0], [+m, 0, 0, 0],
+            [0, -m, 0, 0], [0, +m, 0, 0],
+        ], dtype=torch.float32)
+
+    def sample(self, N: int, H: int, device: str | torch.device) -> torch.Tensor:
+        atoms = self._atoms.to(device)  # (9, 4)
+        idx = torch.randint(0, atoms.shape[0], (N, H), device=device)
+        return atoms[idx]
+
+    def __repr__(self) -> str:
+        return f"KeyboardAtomSampler(atom_magnitude={self.atom_magnitude})"
+
+
 class DemoChunkJitterSampler(DemoChunkSampler):
     """Demo chunks + small per-step Gaussian jitter.
 

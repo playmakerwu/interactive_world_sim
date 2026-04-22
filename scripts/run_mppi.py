@@ -41,6 +41,7 @@ from rl.mppi.action_sampling import (  # noqa: E402
     DemoChunkJitterSampler,
     DemoChunkSampler,
     GaussianSampler,
+    KeyboardAtomSampler,
 )
 from rl.mppi.planner import MPPIPlanner  # noqa: E402
 from rl.mppi.reward import (  # noqa: E402
@@ -218,12 +219,14 @@ def main() -> None:
     ap.add_argument("--action_dim", type=int, default=4)
     ap.add_argument(
         "--action_source",
-        choices=["gaussian", "demo", "demo_jitter"],
+        choices=["gaussian", "demo", "demo_jitter", "keyboard_atoms"],
         default="gaussian",
         help="Action sampling distribution. 'gaussian' = zero-mean randn*sigma "
-             "(v0 default, catastrophically OOD for IWS WM). 'demo' = draw length-H "
-             "slices directly from the train action bank. 'demo_jitter' = same as "
-             "'demo' plus per-step Gaussian noise at --jitter_sigma.",
+             "(v0 default). 'demo' = slices of real demo actions. "
+             "'demo_jitter' = demo + small noise. 'keyboard_atoms' = one of "
+             "9 keyboard atoms per step, each of magnitude 0.02 (mimics the "
+             "PushT teleop); pairs with --accumulator_mode to feed the WM "
+             "the running sum like a human would.",
     )
     ap.add_argument(
         "--demo_train_dir",
@@ -247,6 +250,13 @@ def main() -> None:
         help="Maintain a running H-step action sequence across plan steps. "
              "Each step samples perturbations around this sequence and then "
              "shifts it. Provides temporal persistence between plan_step calls.",
+    )
+    ap.add_argument(
+        "--accumulator_mode", action="store_true",
+        help="Treat sampled actions as DELTAS and accumulate onto a running "
+             "curr_action clamped to [-1, 1]. Mimics teleoperate_keyboard.py: "
+             "the WM sees the running sum, not the delta. Pair with "
+             "--action_source keyboard_atoms for faithful keyboard-MPPI.",
     )
     args = ap.parse_args()
 
@@ -319,6 +329,9 @@ def main() -> None:
             action_sampler = DemoChunkJitterSampler(
                 train_dir=demo_dir, jitter_sigma=args.jitter_sigma,
             )
+        elif args.action_source == "keyboard_atoms":
+            action_sampler = KeyboardAtomSampler(atom_magnitude=0.02,
+                                                  action_dim=args.action_dim)
         else:
             raise AssertionError(args.action_source)
         print(f"Action sampler: {action_sampler}")
@@ -331,6 +344,7 @@ def main() -> None:
             action_sampler=action_sampler,
             selection_rule=args.selection_rule,
             warm_start=args.warm_start,
+            accumulator_mode=args.accumulator_mode,
             labeler=labeler,
             capture_rgb=True,  # snapshots at specific steps
         )
@@ -386,6 +400,8 @@ def main() -> None:
             "cx": round(lbl_t.cx, 2) if lbl_t.success else None,
             "cy": round(lbl_t.cy, 2) if lbl_t.success else None,
             "theta_deg": round(lbl_t.theta_deg, 2) if lbl_t.success else None,
+            "action": [round(float(v), 6) for v in a_star.detach().cpu().tolist()],
+            "action_norm": round(float(a_star.norm().item()), 6),
             "cv_fail_in_plan": int(cv_fail_in_plan),
             "plan_wall_s": round(plan_s, 3),
         })
@@ -399,8 +415,23 @@ def main() -> None:
     print(f"\nRun wall time: {wall_s:.1f} s")
 
     # ------------ save artifacts ------------
-    torch.save(torch.stack(trajectory_latents), out_dir / "trajectory_latents.pt")
+    traj_lat_tensor = torch.stack(trajectory_latents)  # (T+1, C, H, W)
+    torch.save(traj_lat_tensor, out_dir / "trajectory_latents.pt")
     torch.save(torch.stack(action_history), out_dir / "action_history.pt")
+    # Diagnostic: per-step cosine sim of executed latent vs initial.
+    # Used downstream by multiseed analysis to detect OOD drift.
+    z0_flat = traj_lat_tensor[0].flatten().float()
+    cos_to_z0 = torch.tensor(
+        [
+            torch.nn.functional.cosine_similarity(
+                traj_lat_tensor[t].flatten().float().unsqueeze(0),
+                z0_flat.unsqueeze(0),
+            ).item()
+            for t in range(traj_lat_tensor.shape[0])
+        ],
+        dtype=torch.float32,
+    )
+    min_cos_to_z0 = float(cos_to_z0.min())
     # Persist the initial latent (snapshot taken before the loop) so
     # downstream tools (e.g. scripts/wm_interactive_replay.py) can load
     # it without parsing the full trajectory tensor.
@@ -476,6 +507,7 @@ def main() -> None:
             "jitter_sigma": args.jitter_sigma if args.action_source == "demo_jitter" else None,
             "selection_rule": args.selection_rule,
             "warm_start": bool(args.warm_start),
+            "accumulator_mode": bool(args.accumulator_mode),
             "N": args.N, "H": args.H, "sigma": args.sigma,
             "temperature": args.temperature, "seed": args.seed,
             "control_steps": args.control_steps,
@@ -507,6 +539,13 @@ def main() -> None:
         },
         "cv_failures_along_trajectory": sum(
             1 for row in per_step_rows if not row["cv_success"]
+        ),
+        "first_cv_failure_step": next(
+            (row["t"] for row in per_step_rows if not row["cv_success"]), None
+        ),
+        "min_latent_cosine_sim_to_z0": round(min_cos_to_z0, 6),
+        "first_drift_below_0_95_step": next(
+            (i for i, c in enumerate(cos_to_z0.tolist()) if c < 0.95), None
         ),
         "per_step": per_step_rows,
         "wall_time_s": round(wall_s, 1),

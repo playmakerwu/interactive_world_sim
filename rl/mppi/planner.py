@@ -65,6 +65,7 @@ class MPPIPlanner:
         action_sampler: ActionSampler | None = None,
         selection_rule: str = "softmax",  # or "argmax"
         warm_start: bool = False,
+        accumulator_mode: bool = False,
         labeler: CVLabeler | None = None,
         device: str = "cuda:0",
         capture_rgb: bool = False,
@@ -114,6 +115,17 @@ class MPPIPlanner:
         else:
             self._running_seq = None
 
+        # Accumulator mode: mimics teleoperate_keyboard.py. Sampled actions
+        # are treated as *deltas* and accumulated onto a running curr_action
+        # that's clamped to [-1, 1]. The WM sees the running sum — not the
+        # delta. Mutually exclusive with warm_start.
+        self.accumulator_mode = accumulator_mode
+        if accumulator_mode and warm_start:
+            raise ValueError("accumulator_mode and warm_start are mutually exclusive")
+        self._curr_action = (
+            torch.zeros(action_dim, device=device) if accumulator_mode else None
+        )
+
     def _sample_actions(self) -> torch.Tensor:
         return self.action_sampler.sample(self.N, self.H, self.device)
 
@@ -161,6 +173,13 @@ class MPPIPlanner:
             # Under warm-start, the sampler is treated as a perturbation
             # distribution rather than an absolute action distribution.
             actions = self._running_seq.unsqueeze(0) + perturbations
+        elif self.accumulator_mode:
+            # Treat samples as deltas. Accumulate onto self._curr_action
+            # along the horizon, clamp to [-1, 1]. This is what the
+            # teleoperate_keyboard script does: the WM sees the running
+            # sum, never the delta.
+            cum = perturbations.cumsum(dim=1)  # (N, H, A)
+            actions = (self._curr_action.view(1, 1, -1) + cum).clamp(-1.0, 1.0)
         else:
             actions = perturbations
 
@@ -203,14 +222,28 @@ class MPPIPlanner:
             weights = torch.full_like(weights, 1.0 / self.N)
 
         # 6. Pick the executed action by the chosen selection rule.
+        # In accumulator mode, the "first_actions" are ALREADY the accumulated
+        # values (curr_action + first_delta). We also need the delta so we
+        # can update curr_action after selection.
         first_actions = actions[:, 0]  # (N, A)
+        first_deltas = perturbations[:, 0] if self.accumulator_mode else None
         a_naive_mean = first_actions.mean(dim=0)
         if self.selection_rule == "softmax":
             a_star = (weights.unsqueeze(-1) * first_actions).sum(dim=0)  # (A,)
+            if self.accumulator_mode:
+                delta_star = (weights.unsqueeze(-1) * first_deltas).sum(dim=0)
         else:
             # argmax: pick the single first-action of the best-scoring trajectory.
             best_idx = int(rewards_t.argmax().item())
             a_star = first_actions[best_idx]
+            if self.accumulator_mode:
+                delta_star = first_deltas[best_idx]
+        # Commit the delta to the running curr_action for the next plan step.
+        if self.accumulator_mode:
+            self._curr_action = (self._curr_action + delta_star).clamp(-1.0, 1.0)
+            # Return the clamped running sum so run_mppi.py feeds the WM
+            # the exact same value that was scored for this trajectory.
+            a_star = self._curr_action.clone()
 
         # 7. If warm-starting, update the running sequence and shift it for
         # the next plan_step. The update is always the softmax-weighted mean
