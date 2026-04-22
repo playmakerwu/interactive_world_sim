@@ -1,0 +1,14 @@
+{
+  "n_steps": 50,
+  "first_cv_fail_step": null,
+  "n_cv_fails": 0,
+  "first_drift_below_0_95": null,
+  "first_drift_below_0_90": null,
+  "min_cos_z0": 0.953964114189148,
+  "final_cos_z0": 0.9549052119255066,
+  "min_latent_norm": 31.9999942779541,
+  "max_latent_norm": 32.000003814697266,
+  "min_action_norm": 0.01421862281858921,
+  "max_action_norm": 0.11127841472625732,
+  "mean_action_norm": 0.05285927064716816
+}
