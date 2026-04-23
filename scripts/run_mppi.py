@@ -55,7 +55,7 @@ from rl.visualization.state_viz import render_state_on_image  # noqa: E402
 CKPT_PATH = REPO_ROOT / "outputs" / "pusht_cam1" / "checkpoints" / "best.ckpt"
 STATE_GOAL_PATH = REPO_ROOT / "tests" / "goal_selection" / "state_goal.pt"
 RES = 128
-OBS_KEY = "camera_0_color"
+OBS_KEY = "camera_1_color"
 
 SUCCESS_POS_PX = 5.0
 SUCCESS_ANGLE_DEG = 10.0

@@ -57,7 +57,7 @@ N = 16
 H = 10
 SIGMA = 0.1
 SEED = 0
-OBS_KEY = "camera_0_color"
+OBS_KEY = "camera_1_color"
 
 
 def _preprocess_rgb(raw: np.ndarray) -> np.ndarray:

@@ -45,7 +45,7 @@ OUT_DIR = REPO_ROOT / "outputs" / "mppi" / "step2_reward_check"
 
 RES = 128
 N_FRAMES = 10
-OBS_KEY = "camera_0_color"
+OBS_KEY = "camera_1_color"
 
 
 def _pick_ep_path() -> Path:

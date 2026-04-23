@@ -43,7 +43,7 @@ OUT_PT = REPO_ROOT / "tests" / "goal_selection" / "state_goal_offaxis.pt"
 OUT_OVERLAY = REPO_ROOT / "tests" / "goal_selection" / "state_goal_offaxis_overlay.png"
 
 RES = 128
-OBS_KEY = "camera_0_color"
+OBS_KEY = "camera_1_color"
 THETA_ABS_MIN = 30.0
 THETA_ABS_MAX = 60.0
 SCAN_STRIDE = 5  # evaluate every 5th frame for speed

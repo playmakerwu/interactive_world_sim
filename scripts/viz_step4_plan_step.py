@@ -48,7 +48,7 @@ SIGMA = 0.1
 TEMPERATURE = 1.0
 SEED = 0
 TOP_K = 8
-OBS_KEY = "camera_0_color"
+OBS_KEY = "camera_1_color"
 
 
 def _preprocess_rgb(raw: np.ndarray) -> np.ndarray:
