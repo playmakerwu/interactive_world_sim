@@ -179,6 +179,7 @@ mpc_open_loop_logs/
 !tests/state_estimator/sanity_outputs/**/*.png
 !tests/state_estimator/calibration_outputs/**/*.png
 !tests/goal_selection/state_goal_overlay.png
+!tests/goal_selection/pair_catalog_viz.png
 # Note: !tests/goal_selection/state_goal.pt is set after the `*.pt` rule below.
 
 # MPPI diagnostic artefacts under outputs/mppi/ are force-added via
@@ -196,6 +197,7 @@ outputs_dp/
 # Re-include state-estimator artefacts committed for reproducibility
 # (must come after `*.pt` or they get re-ignored).
 !tests/goal_selection/state_goal.pt
+!tests/goal_selection/pair_goals/*.pt
 
 lightning_logs/
 optuna_studies/
