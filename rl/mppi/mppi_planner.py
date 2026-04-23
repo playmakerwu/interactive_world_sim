@@ -1,0 +1,263 @@
+"""MPPI planner — faithful port of diffusion-forcing's planner_v0_0 MPPI.
+
+Algorithm spec: see [MPPI_REFERENCE_NOTES.md](../../MPPI_REFERENCE_NOTES.md)
+at the repo root. Three primitives:
+
+  1. ``sample_action_sequences(act_seq) -> (N, H, A)``
+     Apply temporally-correlated noise (smoothed across the H horizon by
+     ``beta_filter``) onto a running ``act_seq``. Per-step actions clipped
+     to ``[action_lower_lim, action_upper_lim]``.
+
+  2. ``optimize_action_mppi(act_seqs, rewards) -> (H, A)``
+     Softmax-weighted mean of the N candidate sequences using
+     ``softmax(rewards * reward_weight)``. We add a max-subtract for
+     numerical stability — see notes file for the (mathematically
+     identical, computationally safer) rationale.
+
+  3. ``trajectory_optimization(z_current, goal_state, init_act_seq) ->
+     (act_seq, stats)``
+     Iterate sampler-rollout-score-aggregator ``n_update_iter`` times.
+     Stateless across calls.
+
+The reward function is the only intentional deviation: we use
+``env.compute_reward`` (CV-based) where the reference accepts an
+``evaluate_traj`` callback. Everything else matches the reference.
+
+Old single-shot ``rl/mppi/planner.py`` is retained for the Phase 2
+consistency comparison and will be deprecated after that.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+import torch
+import torch.nn.functional as F
+from omegaconf import DictConfig
+
+from env.pusht_wm_env import PushTWMEnv
+
+
+@dataclass
+class PlanStats:
+    """Per-plan-step debug record. Captured for offline inspection."""
+
+    act_seq: torch.Tensor                         # (H, A) final converged plan
+    final_iter_rewards: torch.Tensor              # (N,) rewards at the LAST iteration
+    final_iter_weights: torch.Tensor              # (N,) softmax weights at LAST iter
+    n_cv_failures_final_iter: int                 # how many trajectories had CV fail
+    iter_best_rewards: list[float] = field(default_factory=list)  # per-iter R.max()
+
+
+class MPPIPlanner:
+    """Faithful port of diffusion-forcing's MPPI planner."""
+
+    def __init__(self, env: PushTWMEnv, config: DictConfig | dict[str, Any]) -> None:
+        self.env = env
+        self.cfg = (
+            config if isinstance(config, DictConfig) else DictConfig(config)
+        )
+        self.device = env.device
+
+        self._validate_config()
+
+        self.action_lower_lim = torch.as_tensor(
+            list(self.cfg.action_lower_lim), dtype=torch.float32, device=self.device,
+        )
+        self.action_upper_lim = torch.as_tensor(
+            list(self.cfg.action_upper_lim), dtype=torch.float32, device=self.device,
+        )
+
+        # Last plan-step debug record (overwritten each plan_step).
+        self.last_stats: PlanStats | None = None
+
+        # Reproducibility: dedicated generator for action noise so we don't
+        # disturb the global CUDA RNG that the WM denoiser consumes.
+        self._gen = torch.Generator(device=self.device)
+        self._gen.manual_seed(int(self.cfg.seed))
+
+    # ── primitives ───────────────────────────────────────────────────
+
+    def sample_action_sequences(self, act_seq: torch.Tensor) -> torch.Tensor:
+        """``(H, A) -> (N, H, A)`` faithful port of reference sampler.
+
+        Reference: ``planner_v0_0.py:196-256``.
+        """
+        N = int(self.cfg.n_sample)
+        H = int(self.cfg.n_look_ahead)
+        A = int(self.cfg.action_dim)
+        beta = float(self.cfg.beta_filter)
+        sigma = float(self.cfg.noise_level)
+
+        assert act_seq.shape == (H, A), (
+            f"act_seq must be (H={H}, A={A}); got {tuple(act_seq.shape)}"
+        )
+
+        act_seqs = act_seq.unsqueeze(0).expand(N, -1, -1).clone().to(self.device)
+        act_residual = torch.zeros(N, A, dtype=act_seqs.dtype, device=self.device)
+
+        for i in range(H):
+            noise_sample = torch.randn(
+                (N, A), generator=self._gen, device=self.device,
+                dtype=act_seqs.dtype,
+            ) * sigma
+            act_residual = beta * noise_sample + (1.0 - beta) * act_residual
+            new_step = act_seqs[:, i] + act_residual
+            new_step = torch.clamp(new_step, self.action_lower_lim, self.action_upper_lim)
+            act_seqs[:, i] = new_step
+
+        return act_seqs
+
+    def optimize_action_mppi(
+        self,
+        act_seqs: torch.Tensor,
+        reward_seqs: torch.Tensor,
+    ) -> torch.Tensor:
+        """``(N, H, A), (N,) -> (H, A)`` softmax-weighted mean.
+
+        Reference: ``planner_v0_0.py:390-400``. We add a max-subtract for
+        numerical stability — the reference omits this, but with
+        ``reward_weight=200`` and CV-fail rewards of -10, the unstabilised
+        version produces ``exp(-2000)`` which underflows. The shifted form
+        is mathematically identical for the softmax output.
+        """
+        # softmax(R * w) == softmax((R - R.max()) * w) when w > 0
+        rw = float(self.cfg.reward_weight)
+        # Rewards come from the CPU-side CV pipeline; bring them onto the same
+        # device as the action tensors before softmax.
+        reward_seqs = reward_seqs.to(act_seqs.device).float()
+        scaled = reward_seqs * rw
+        weights = F.softmax(scaled - scaled.max(), dim=0)  # (N,)
+        return (act_seqs * weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=0), weights
+
+    # ── main planning loop ───────────────────────────────────────────
+
+    def evaluate_trajectories(
+        self,
+        z_current: torch.Tensor,
+        act_seqs: torch.Tensor,
+        goal_state: dict[str, Any],
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Roll out N trajectories, decode finals, score via CV reward.
+
+        Args:
+            z_current: ``(C, H_lat, W_lat)`` single latent.
+            act_seqs: ``(N, H, A)``.
+            goal_state: dict with scalar ``cx, cy, sin_theta, cos_theta``.
+
+        Returns:
+            ``(rewards (N,), state_dict_at_final)``
+        """
+        N = act_seqs.shape[0]
+        z0_batch = z_current.unsqueeze(0).expand(N, -1, -1, -1).contiguous()
+        with torch.no_grad():
+            traj = self.env.rollout(z0_batch, act_seqs)  # (N, H+1, C, h, w)
+        z_final = traj[:, -1]  # (N, C, h, w)
+        # Free the rollout-time scratch before decode (Step 3 finding from
+        # the prior project — decode attention needs ~4 GiB scratch).
+        del traj
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        state = self.env.estimate_from_latent(z_final)  # batched dict
+        rewards = self.env.compute_reward(
+            state, goal_state,
+            image_diagonal=self.env.image_diagonal,
+            cv_fail_penalty=float(self.cfg.cv_fail_penalty),
+        )
+        return rewards, state
+
+    def trajectory_optimization(
+        self,
+        z_current: torch.Tensor,
+        goal_state: dict[str, Any],
+        init_act_seq: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, PlanStats]:
+        """One full plan: returns ``(act_seq, stats)``.
+
+        Reference: ``planner_v0_0.py:428-483``.
+
+        Args:
+            z_current: ``(C, H_lat, W_lat)`` current latent.
+            goal_state: dict with scalar ``cx, cy, sin_theta, cos_theta``.
+            init_act_seq: optional ``(H, A)`` initial guess. Defaults to
+                a zero sequence (matching the reference's stateless behaviour
+                — caller may choose to pass the previous plan's result if
+                cross-step warm-start is desired, but the reference does not).
+        """
+        H = int(self.cfg.n_look_ahead)
+        A = int(self.cfg.action_dim)
+        if init_act_seq is None:
+            act_seq = torch.zeros(H, A, dtype=torch.float32, device=self.device)
+        else:
+            assert init_act_seq.shape == (H, A), (
+                f"init_act_seq must be (H={H}, A={A}); got {tuple(init_act_seq.shape)}"
+            )
+            act_seq = init_act_seq.to(self.device).float()
+
+        z_current = z_current.to(self.device)
+        if z_current.dim() == 4:
+            assert z_current.shape[0] == 1
+            z_current = z_current[0]
+
+        iter_best_rewards: list[float] = []
+        last_rewards: torch.Tensor | None = None
+        last_weights: torch.Tensor | None = None
+        last_state: dict[str, Any] | None = None
+
+        for _ in range(int(self.cfg.n_update_iter)):
+            act_seqs = self.sample_action_sequences(act_seq)         # (N, H, A)
+            rewards, state = self.evaluate_trajectories(z_current, act_seqs, goal_state)
+            act_seq, weights = self.optimize_action_mppi(act_seqs, rewards)
+            iter_best_rewards.append(float(rewards.max()))
+            last_rewards = rewards.detach().cpu()
+            last_weights = weights.detach().cpu()
+            last_state = state
+
+        n_fail = int((~last_state["success"]).sum().item()) if last_state else 0
+        stats = PlanStats(
+            act_seq=act_seq.detach().cpu(),
+            final_iter_rewards=last_rewards if last_rewards is not None else torch.empty(0),
+            final_iter_weights=last_weights if last_weights is not None else torch.empty(0),
+            n_cv_failures_final_iter=n_fail,
+            iter_best_rewards=iter_best_rewards,
+        )
+        self.last_stats = stats
+        return act_seq, stats
+
+    def plan_step(
+        self,
+        z_current: torch.Tensor,
+        goal_state: dict[str, Any],
+        init_act_seq: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Convenience: run trajectory optimization, return only the first action."""
+        act_seq, _stats = self.trajectory_optimization(z_current, goal_state, init_act_seq)
+        return act_seq[0]
+
+    # ── helpers ──────────────────────────────────────────────────────
+
+    def _validate_config(self) -> None:
+        required = (
+            "n_sample", "n_look_ahead", "n_update_iter", "noise_level",
+            "reward_weight", "beta_filter",
+            "action_lower_lim", "action_upper_lim", "action_dim",
+            "cv_fail_penalty", "seed",
+        )
+        for k in required:
+            if k not in self.cfg:
+                raise ValueError(f"config missing required key: {k!r}")
+        if len(self.cfg.action_lower_lim) != self.cfg.action_dim:
+            raise ValueError(
+                f"action_lower_lim length {len(self.cfg.action_lower_lim)} "
+                f"!= action_dim {self.cfg.action_dim}"
+            )
+        if len(self.cfg.action_upper_lim) != self.cfg.action_dim:
+            raise ValueError(
+                f"action_upper_lim length {len(self.cfg.action_upper_lim)} "
+                f"!= action_dim {self.cfg.action_dim}"
+            )
+        if self.cfg.action_dim != self.env.action_dim:
+            raise ValueError(
+                f"config action_dim {self.cfg.action_dim} != env.action_dim {self.env.action_dim}"
+            )
