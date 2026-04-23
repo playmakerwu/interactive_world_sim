@@ -1,0 +1,118 @@
+{
+  "pair_D": {
+    "description": "flipped goal (theta ~ 180)",
+    "start": {
+      "hdf5_path": "data/mini/pusht/val/episode_2.hdf5",
+      "frame_idx": 196,
+      "cx": 102.29147821032915,
+      "cy": 52.03763728220707,
+      "sin_theta": -0.9367509134116973,
+      "cos_theta": 0.3499967517311423,
+      "theta_deg": -69.51288356372447,
+      "icp_residual": 0.4008538952288632
+    },
+    "goal": {
+      "hdf5_path": "data/mini/pusht/val/episode_3.hdf5",
+      "frame_idx": 152,
+      "raw_cx": 23.145000762939425,
+      "raw_cy": 40.21500137329095,
+      "raw_theta_deg": 180.0,
+      "round_tripped_cx": 23.14500053405759,
+      "round_tripped_cy": 40.21500030517584,
+      "round_tripped_theta_deg": 180.0,
+      "round_tripped_icp_residual": 1.3126106519671784e-06,
+      "state_pt_path": "tests/goal_selection/pair_goals/pair_D_goal.pt"
+    },
+    "distance_px": 80.025,
+    "angular_difference_deg": 110.49,
+    "target_angle_deg": 180.0,
+    "target_angle_tol_deg": 15.0
+  },
+  "pair_C": {
+    "description": "90-degree goal",
+    "start": {
+      "hdf5_path": "data/mini/pusht/val/episode_1.hdf5",
+      "frame_idx": 189,
+      "cx": 62.877900357919586,
+      "cy": 89.21577106746287,
+      "sin_theta": 0.5450476966299719,
+      "cos_theta": 0.8384050383903726,
+      "theta_deg": 33.02792311239094,
+      "icp_residual": 0.3151914694268749
+    },
+    "goal": {
+      "hdf5_path": "data/mini/pusht/val/episode_4.hdf5",
+      "frame_idx": 151,
+      "raw_cx": 63.21499816894535,
+      "raw_cy": 32.85499984741213,
+      "raw_theta_deg": 90.0,
+      "round_tripped_cx": 63.16859457639125,
+      "round_tripped_cy": 32.865382717302275,
+      "round_tripped_theta_deg": 90.1962196998656,
+      "round_tripped_icp_residual": 0.09161002676037298,
+      "state_pt_path": "tests/goal_selection/pair_goals/pair_C_goal.pt"
+    },
+    "distance_px": 56.362,
+    "angular_difference_deg": 56.97,
+    "target_angle_deg": 90.0,
+    "target_angle_tol_deg": 10.0
+  },
+  "pair_B": {
+    "description": "45-degree goal",
+    "start": {
+      "hdf5_path": "data/mini/pusht/val/episode_3.hdf5",
+      "frame_idx": 189,
+      "cx": 20.371722464451754,
+      "cy": 37.14709164581241,
+      "sin_theta": 0.17834111101779354,
+      "cos_theta": -0.9839687231416144,
+      "theta_deg": 169.72685089593801,
+      "icp_residual": 0.416611261427741
+    },
+    "goal": {
+      "hdf5_path": "data/mini/pusht/val/episode_2.hdf5",
+      "frame_idx": 50,
+      "raw_cx": 72.58460215682635,
+      "raw_cy": 32.302151282967195,
+      "raw_theta_deg": 44.74074252429958,
+      "round_tripped_cx": 72.8896734831471,
+      "round_tripped_cy": 33.063176450495625,
+      "round_tripped_theta_deg": 48.63876262977897,
+      "round_tripped_icp_residual": 0.41201229614512086,
+      "state_pt_path": "tests/goal_selection/pair_goals/pair_B_goal.pt"
+    },
+    "distance_px": 52.437,
+    "angular_difference_deg": 124.99,
+    "target_angle_deg": 45.0,
+    "target_angle_tol_deg": 10.0
+  },
+  "pair_A": {
+    "description": "near-axis goal (theta ~ 0)",
+    "start": {
+      "hdf5_path": "data/mini/pusht/val/episode_4.hdf5",
+      "frame_idx": 0,
+      "cx": 52.775003741466044,
+      "cy": 79.49405100028162,
+      "sin_theta": 0.9654224486585523,
+      "cos_theta": -0.26069042104788753,
+      "theta_deg": 105.11103322107897,
+      "icp_residual": 0.4127606940379873
+    },
+    "goal": {
+      "hdf5_path": "data/mini/pusht/val/episode_2.hdf5",
+      "frame_idx": 93,
+      "raw_cx": 86.8549993896486,
+      "raw_cy": 41.784999389648384,
+      "raw_theta_deg": 0.0,
+      "round_tripped_cx": 86.85500274658216,
+      "round_tripped_cy": 41.78500183105471,
+      "round_tripped_theta_deg": 2.842170943040401e-14,
+      "round_tripped_icp_residual": 1.6434218634814413e-06,
+      "state_pt_path": "tests/goal_selection/pair_goals/pair_A_goal.pt"
+    },
+    "distance_px": 50.827,
+    "angular_difference_deg": 105.11,
+    "target_angle_deg": 0.0,
+    "target_angle_tol_deg": 10.0
+  }
+}
