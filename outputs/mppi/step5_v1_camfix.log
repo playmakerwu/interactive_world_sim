@@ -1,0 +1,66 @@
+Loading WM from /home/yiru-wu/Documents/interactive_world_sim/outputs/pusht_cam1/checkpoints/best.ckpt
+Non-A100 GPU detected, using math or mem efficient attention if                     input tensor is on cuda
+Loading state_goal from /home/yiru-wu/Documents/interactive_world_sim/tests/goal_selection/state_goal.pt
+Resolving initial state: mini/val/0/0
+  t=00  r=-0.0009  cv=(56,63,-0.1°)
+Action sampler: GaussianSampler(sigma=0.1, action_dim=4)
+  t=01  r=-0.0012  cv=(56,63,+0.0°)  plan=6.39s
+  t=02  r=-0.0012  cv=(56,63,+0.0°)  plan=5.77s
+  t=03  r=-0.0012  cv=(56,63,+0.0°)  plan=5.70s
+  t=04  r=-0.0012  cv=(56,63,-0.0°)  plan=5.72s
+  t=05  r=-0.0067  cv=(57,63,+0.0°)  plan=5.71s
+  t=06  r=-0.0071  cv=(57,63,-0.5°)  plan=5.71s
+  t=07  r=-0.0067  cv=(57,63,+0.0°)  plan=5.74s
+  t=08  r=-0.0155  cv=(58,62,-2.3°)  plan=5.72s
+  t=09  r=-0.0132  cv=(58,62,-0.4°)  plan=5.75s
+  t=10  r=-0.0208  cv=(59,62,-2.2°)  plan=5.73s
+  t=11  r=-0.0177  cv=(59,63,+0.0°)  plan=6.57s
+  t=12  r=-0.0185  cv=(59,62,-0.4°)  plan=5.74s
+  t=13  r=-0.0235  cv=(60,63,-0.6°)  plan=5.75s
+  t=14  r=-0.0261  cv=(60,63,+1.5°)  plan=5.74s
+  t=15  r=-0.0235  cv=(60,63,+0.1°)  plan=5.78s
+  t=16  r=-0.0289  cv=(61,63,-0.5°)  plan=5.80s
+  t=17  r=-0.0291  cv=(61,63,-0.1°)  plan=5.80s
+  t=18  r=-0.0291  cv=(61,63,-0.3°)  plan=5.79s
+  t=19  r=-0.0294  cv=(61,63,-0.6°)  plan=5.76s
+  t=20  r=-0.0337  cv=(62,63,-0.3°)  plan=5.77s
+  t=21  r=-0.0332  cv=(62,63,-0.4°)  plan=6.41s
+  t=22  r=-0.0336  cv=(62,63,-0.3°)  plan=5.96s
+  t=23  r=-0.0343  cv=(62,63,+0.0°)  plan=5.79s
+  t=24  r=-0.0343  cv=(62,63,+0.0°)  plan=5.75s
+  t=25  r=-0.0376  cv=(62,63,+1.6°)  plan=5.78s
+  t=26  r=-0.0343  cv=(62,63,+0.0°)  plan=5.79s
+  t=27  r=-0.0412  cv=(63,63,-0.8°)  plan=5.92s
+  t=28  r=-0.0404  cv=(63,62,-1.0°)  plan=5.81s
+  t=29  r=-0.0398  cv=(63,63,-0.1°)  plan=5.88s
+  t=30  r=-0.0398  cv=(63,63,+0.1°)  plan=5.82s
+  t=31  r=-0.0436  cv=(63,63,-2.4°)  plan=6.94s
+  t=32  r=-0.0446  cv=(63,63,-2.8°)  plan=5.91s
+  t=33  r=-0.0457  cv=(64,62,-0.7°)  plan=6.01s
+  t=34  r=-0.0494  cv=(64,62,-2.4°)  plan=5.96s
+  t=35  r=-0.0457  cv=(64,63,+0.0°)  plan=6.02s
+  t=36  r=-0.0525  cv=(65,63,-0.6°)  plan=5.95s
+  t=37  r=-0.0395  cv=(61,63,+8.7°)  plan=5.76s
+  t=38  r=-0.0416  cv=(61,63,+9.6°)  plan=5.78s
+  t=39  r=-0.0392  cv=(61,63,+8.5°)  plan=5.81s
+  t=40  r=-0.0397  cv=(61,64,+8.6°)  plan=5.77s
+  t=41  r=-1.1389  cv=(61,64,+96.9°)  plan=6.47s
+  t=42  r=-0.0555  cv=(62,64,+11.8°)  plan=5.79s
+  t=43  r=-1.1379  cv=(62,64,+96.5°)  plan=5.91s
+  t=44  r=-1.1285  cv=(62,64,+95.9°)  plan=5.79s
+  t=45  r=-1.1595  cv=(63,64,+97.4°)  plan=5.87s
+  t=46  r=-1.4854  cv=(67,61,+115.6°)  plan=5.79s
+  t=47  r=-1.4997  cv=(68,60,+116.4°)  plan=6.00s
+  t=48  r=-1.4657  cv=(68,60,+114.0°)  plan=5.80s
+  t=49  r=-1.4785  cv=(69,60,+114.6°)  plan=6.08s
+  t=50  r=-1.4971  cv=(68,60,+115.9°)  plan=5.98s
+
+Run wall time: 294.8 s
+
+--- summary ---
+success_strict = False
+success_cos    = False
+flipped_conv.  = False
+final_pos_dist = 12.952006497489513
+final_angle_err= 115.18747343412201
+final_cos_sim  = -0.4255814592164475

@@ -1,5 +1,16 @@
 # MPPI on IWS — Design Notes and Results
 
+> ⚠️ **READ FIRST — CAMERA-MISMATCH BUG**
+>
+> All numerical results from §Step 5 onward (v1, v2, v3, v4, v5, v6, v7, v8,
+> v10, the 10-pair sweep, and every Step-2/3/4 visualization) were produced
+> while the inference scripts hard-coded `OBS_KEY = "camera_0_color"` (side
+> view), but the WM was trained on `camera_1_color` (top-down). See
+> `outputs/camera_investigation/root_cause_confirmed.md`. Fix landed in commit
+> `fd875ef`. Results superseded by §Camera Fix Validation below. The
+> keyboard-MPPI v10 finding (accumulator vs. independent sampling) is
+> camera-independent and survives.
+
 A minimal MPPI (Model Predictive Path Integral) controller layered on top of the
 pretrained IWS latent world model, using the classical CV T-block pose estimator
 (vendored from the supervisor's repo at `rl/labeling/cv_labeler.py`) as reward.
@@ -731,3 +742,85 @@ concrete first thing to try.
    with `|sin(2θ)|, |cos(2θ)|` labels and see if the sin/cos
    collapse resolves. If it does, the whole PushT stack has a
    unified "180° symmetry causes gradient noise" story.
+
+## § Camera Fix Validation
+
+After commit `fd875ef` flipped six PushT inference scripts from
+`camera_0_color` to `camera_1_color`, re-ran the v1 sanity check
+(N=16, H=10, σ=0.1, 50 steps, seed=0) and compared against the
+broken-camera v1 result.
+
+| metric                       | v1 BROKEN (camera_0) | **v1_camfix (camera_1)** |
+|------------------------------|----------------------|--------------------------|
+| final_pos_distance_px        | 28.51                | **12.95**                |
+| final_angle_error_deg        | -134.70              | +115.19                  |
+| final_angle_sim              | -0.70                | -0.43                    |
+| min_latent_cosine_sim_to_z0  | 0.946                | **0.985**                |
+| first_drift_below_0.95_step  | 24                   | **never** (None)         |
+| n_cv_failures                | 4                    | **0**                    |
+| first_cv_failure_step        | 42                   | **never** (None)         |
+| best reward in trajectory    | -0.16                | **-0.0009**              |
+| success_strict / _cos        | False / False        | False / False            |
+
+### Visual answers (from `outputs/mppi/step5_v1_camfix/v1_broken_vs_camfix.png`)
+
+- Arms visible throughout 50 steps? — **YES** (both arms with orange grippers visible at t=0, 10, 25, 40, 50)
+- T-block geometry plausible (looks like a T, not a blob)? — **YES**
+- Scene is top-down view (matches `camera_1_color` framing)? — **YES**
+
+### Critical context: v1_camfix's initial state was already AT the goal
+
+The decoded initial frame from val/0/0 under camera_1 has CV pose
+**(55.80, 62.79, −0.11°)**. The goal (computed from a different val/0
+frame on the probe branch) is **(55.66, 62.75, +0.75°)**.
+**Initial distance to goal: 0.14 px. Initial reward: −0.0009.**
+
+So this run is testing "does MPPI HOLD the goal under random sampling?"
+not "does MPPI REACH the goal?". The answer is **no — it drifts**.
+Over 50 steps the controller's `a*` (softmax-mean of zero-mean Gaussian
+samples) doesn't actively counteract the WM's intrinsic stochastic drift,
+so the T pose drifts from (55.8, 62.8, −0.1°) at t=0 to (68.4, 60.0, +115.9°)
+at t=50.
+
+### Outcome classification (per spec §3.3)
+
+**Outcome (B)** — substantial improvement, but not full success.
+
+What changed under the camera fix:
+- Latent stays in distribution: `min_cos(z_t, z_0) = 0.985` (vs broken's 0.946)
+- CV never fails: 0 failures (vs broken's 4)
+- Decoded scene stays coherent: arms persist through 50 steps
+- T-block geometry stays valid: no blob collapses
+- Reward space is meaningful: best reward is essentially zero (−0.0009)
+  — the controller IS being shown the goal as an achievable state
+
+What didn't change:
+- Final pose still off-goal — but for a DIFFERENT reason than before.
+  Before: the latent was OOD and MPPI was searching in noise.
+  Now: the latent is in distribution, the controller has a clean signal,
+  but its zero-mean Gaussian sampler doesn't produce actions that hold
+  position against WM-internal stochastic drift.
+
+The remaining gap is now classic MPPI tuning territory (warm-start, hold
+prior actions, reduce per-step exploration, dense reward through horizon)
+— not OOD pathology. **Camera was the dominant cause; MPPI's drift-into-
+noise is a smaller second-order issue we now have a clean handle on.**
+
+### Implications for prior conclusions
+
+| prior conclusion | camera-fix verdict |
+|------------------|---------------------|
+| 180° flip dominates v1 (§Step 5, §Step 4 smoking gun) | INVALIDATED — flips happened because decoded scene was a malformed top-view-of-side-data hallucination, not because of T symmetry |
+| sym-aware reward halves position error (v1 → v2) | INVALIDATED — the improvement may have been camera-mode-dependent |
+| demo-action sampling (v5/v6/v7) doesn't help | NEEDS RE-VALIDATION |
+| warm-start preserves arms (v8) | LIKELY STILL TRUE but needs camera-fix re-run |
+| keyboard-MPPI v10 (accumulator) preserves arms | **CAMERA-INDEPENDENT — STILL VALID.** The accumulator vs. independent-sampling argument is purely about action-distribution shape, not about which camera the WM was trained on. |
+| §Step 5 full failure analysis | INVALIDATED — every numerical claim needs camera-fix re-run |
+
+### Artifacts
+
+- [outputs/mppi/step5_v1_camfix/trajectory.mp4](outputs/mppi/step5_v1_camfix/trajectory.mp4)
+- [outputs/mppi/step5_v1_camfix/trajectory_overlay.mp4](outputs/mppi/step5_v1_camfix/trajectory_overlay.mp4)
+- [outputs/mppi/step5_v1_camfix/showcase.mp4](outputs/mppi/step5_v1_camfix/showcase.mp4) (upscaled side-by-side)
+- [outputs/mppi/step5_v1_camfix/v1_broken_vs_camfix.png](outputs/mppi/step5_v1_camfix/v1_broken_vs_camfix.png) (visual proof)
+- [outputs/mppi/step5_v1_camfix/summary.json](outputs/mppi/step5_v1_camfix/summary.json)
