@@ -57,6 +57,24 @@ def main() -> None:
     ap.add_argument("--initial_frame", type=int, default=0)
     ap.add_argument("--goal", required=True, help="Path to a state_goal.pt")
     ap.add_argument("--output_dir", required=True)
+    ap.add_argument(
+        "--n_sample", type=int, default=None,
+        help="Override config.n_sample at runtime (for VRAM-constrained "
+             "local runs). When used, summary.json records a config_deviation "
+             "block listing the override and its rationale (which the caller "
+             "must pass via --override_reason).",
+    )
+    ap.add_argument(
+        "--override_reason", type=str, default=None,
+        help="Free-text justification for any --n_sample override. Stored in "
+             "summary.json under config_deviation.reason.",
+    )
+    ap.add_argument(
+        "--expected_impact", type=str, default=None,
+        help="Free-text quantified expected impact of the override. Stored in "
+             "summary.json under config_deviation.expected_impact_quantified. "
+             "If omitted, a generic placeholder is used.",
+    )
     args = ap.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -65,7 +83,33 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     cfg = OmegaConf.load(args.config)
-    print(f"Config: {OmegaConf.to_yaml(cfg)}")
+    # Track any runtime overrides so summary.json can record a config_deviation
+    # block. This protects against silently changing the algorithm under the
+    # rug — every deviation must be explicitly flagged + justified by caller.
+    config_deviation = {"changed": [], "reason": None, "expected_impact_quantified": None}
+    if args.n_sample is not None and int(args.n_sample) != int(cfg.n_sample):
+        config_deviation["changed"].append(
+            f"n_sample: {int(cfg.n_sample)} -> {int(args.n_sample)}"
+        )
+        cfg.n_sample = int(args.n_sample)
+    if config_deviation["changed"]:
+        if not args.override_reason:
+            raise SystemExit(
+                "ERROR: --n_sample (or other override) used without "
+                "--override_reason. Every config deviation must be justified "
+                "in writing so the audit trail in summary.json explains why."
+            )
+        config_deviation["reason"] = args.override_reason
+        config_deviation["expected_impact_quantified"] = (
+            args.expected_impact or
+            "Fewer samples per iteration means sparser coverage of action "
+            "space per plan_step. Iterative refinement (n_update_iter) "
+            "partially compensates. Empirical performance may differ from "
+            "the configured-default N. Replication at the configured N is "
+            "recommended for paper numbers."
+        )
+        print(f"\n[!! config deviation] {config_deviation}\n")
+    print(f"Effective config:\n{OmegaConf.to_yaml(cfg)}")
 
     print(f"Loading WM from {args.wm_ckpt}")
     env = PushTWMEnv(args.wm_ckpt, device="cuda:0")
@@ -182,28 +226,100 @@ def main() -> None:
             + math.cos(math.radians(final["theta_deg"])) * goal["cos_theta"]
         )
 
+    # Initial measured distance (when CV succeeds on the initial decode).
+    initial_distance_to_goal = None
+    if initial["cv_success"]:
+        idx = initial["cx"] - goal["cx"]
+        idy = initial["cy"] - goal["cy"]
+        initial_distance_to_goal = math.sqrt(idx * idx + idy * idy)
+
+    # Phase 2 acceptance metrics
+    success_strict = (
+        final_pos is not None and final_pos <= 5.0
+        and final_ang_err is not None and abs(final_ang_err) <= 10.0
+    )
+    success_cos = (
+        final_pos is not None and final_pos <= 5.0
+        and final_cos_sim is not None and final_cos_sim >= 0.94
+    )
+    last_10_rewards = [row["reward"] for row in per_step[-10:]]
+    mean_reward_last_10 = float(np.mean(last_10_rewards))
+
+    # Latent drift over the executed trajectory
+    latents_t = torch.stack(trajectory_latents).float()  # (T+1, C, H, W)
+    z0_flat = latents_t[0].flatten()
+    cos_to_z0 = torch.tensor([
+        torch.nn.functional.cosine_similarity(
+            latents_t[t].flatten().unsqueeze(0), z0_flat.unsqueeze(0)
+        ).item() for t in range(latents_t.shape[0])
+    ])
+    min_cos_to_z0 = float(cos_to_z0.min())
+
     summary = {
         "config": OmegaConf.to_container(cfg, resolve=True),
+        "config_deviation": config_deviation,
         "initial_state": {
             "hdf5": args.initial_hdf5,
             "frame": args.initial_frame,
             "cv": initial,
+            "distance_to_goal_px": (
+                None if initial_distance_to_goal is None
+                else round(initial_distance_to_goal, 3)
+            ),
         },
         "goal_state": {"cx": goal["cx"], "cy": goal["cy"], "theta_deg": goal["theta_deg"]},
         "final_state": final,
         "final_pos_distance_px": None if final_pos is None else round(final_pos, 3),
         "final_angle_error_deg": None if final_ang_err is None else round(final_ang_err, 2),
         "final_angle_sim": None if final_cos_sim is None else round(final_cos_sim, 4),
+        "success_strict": bool(success_strict),
+        "success_cos": bool(success_cos),
+        "min_latent_cosine_sim_to_z0": round(min_cos_to_z0, 4),
         "n_cv_failures": sum(1 for r in per_step if not r["cv_success"]),
+        "mean_reward_last_10_steps": round(mean_reward_last_10, 4),
+        "best_reward_in_trajectory": round(
+            float(max(row["reward"] for row in per_step)), 4
+        ),
         "wall_time_s": round(wall_total, 1),
         "wall_per_step_s": round(wall_total / max(1, int(cfg.control_steps)), 3),
         "per_step": per_step,
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+
+    # If the run involved any config deviation, also drop a cloud-ready
+    # reproduction script that uses the configured-default values.
+    if config_deviation["changed"]:
+        cloud_script = out_dir / "reproduce_on_cloud.sh"
+        cloud_script.write_text(
+            "#!/usr/bin/env bash\n"
+            "# Cloud reproduction of this run at the configured-default "
+            "hyperparameters\n"
+            "# (no --n_sample override). Requires GPU with >=20 GiB free for "
+            "decoder\n"
+            "# attention scratch at the default n_sample.\n"
+            "#\n"
+            f"# This local run used: {', '.join(config_deviation['changed'])}\n"
+            f"# Reason: {config_deviation['reason']}\n"
+            "set -e\n"
+            "cd \"$(dirname \"$0\")/../../..\"\n"
+            f"python scripts/run_mppi_v2.py \\\n"
+            f"    --config {args.config} \\\n"
+            f"    --wm_ckpt {args.wm_ckpt} \\\n"
+            f"    --initial_hdf5 {args.initial_hdf5} \\\n"
+            f"    --initial_frame {args.initial_frame} \\\n"
+            f"    --goal {args.goal} \\\n"
+            f"    --output_dir {args.output_dir}_cloud_repro\n"
+        )
+        cloud_script.chmod(0o755)
+        print(f"  reproduction script: {cloud_script}")
+
     print(f"\nWrote artifacts to {out_dir}")
-    print(f"  final_pos_distance_px = {final_pos}")
-    print(f"  final_angle_error_deg = {final_ang_err}")
-    print(f"  n_cv_failures = {summary['n_cv_failures']}")
+    print(f"  final_pos_distance_px      = {final_pos}")
+    print(f"  final_angle_error_deg      = {final_ang_err}")
+    print(f"  min_latent_cosine_sim_to_z0= {min_cos_to_z0:.4f}")
+    print(f"  n_cv_failures              = {summary['n_cv_failures']}")
+    print(f"  mean_reward_last_10_steps  = {mean_reward_last_10:.4f}")
+    print(f"  success_strict / _cos      = {success_strict} / {success_cos}")
 
 
 if __name__ == "__main__":
