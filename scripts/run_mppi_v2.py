@@ -36,6 +36,51 @@ from env.pusht_wm_env import PushTWMEnv  # noqa: E402
 from rl.mppi.mppi_planner import MPPIPlanner  # noqa: E402
 
 
+def _apply_cli_overrides(cfg, args) -> dict:
+    """Apply CLI overrides to the loaded OmegaConf in place.
+
+    Returns a ``config_deviation`` dict (always with the same shape).
+    Only ``--n_sample`` counts as an algorithm deviation requiring an
+    explicit ``--override_reason``; ``--control_steps`` and ``--seed``
+    are legitimate per-run knobs (episode length and which run variant)
+    that don't change MPPI's algorithmic behavior.
+
+    Split out so tests can exercise override logic without loading the
+    WM or constructing PushTWMEnv.
+    """
+    config_deviation = {"changed": [], "reason": None, "expected_impact_quantified": None}
+
+    if getattr(args, "control_steps", None) is not None:
+        cfg.control_steps = int(args.control_steps)
+    if getattr(args, "seed", None) is not None:
+        cfg.seed = int(args.seed)
+
+    if getattr(args, "n_sample", None) is not None and int(args.n_sample) != int(cfg.n_sample):
+        config_deviation["changed"].append(
+            f"n_sample: {int(cfg.n_sample)} -> {int(args.n_sample)}"
+        )
+        cfg.n_sample = int(args.n_sample)
+
+    if config_deviation["changed"]:
+        if not getattr(args, "override_reason", None):
+            raise SystemExit(
+                "ERROR: --n_sample (or other algorithm-level override) used "
+                "without --override_reason. Every config deviation must be "
+                "justified in writing so the audit trail in summary.json "
+                "explains why."
+            )
+        config_deviation["reason"] = args.override_reason
+        config_deviation["expected_impact_quantified"] = (
+            getattr(args, "expected_impact", None) or
+            "Fewer samples per iteration means sparser coverage of action "
+            "space per plan_step. Iterative refinement (n_update_iter) "
+            "partially compensates. Empirical performance may differ from "
+            "the configured-default N. Replication at the configured N is "
+            "recommended for paper numbers."
+        )
+    return config_deviation
+
+
 def _write_mp4(frames: list[np.ndarray], out_path: Path, fps: int = 8) -> None:
     if not frames:
         return
@@ -75,6 +120,17 @@ def main() -> None:
              "summary.json under config_deviation.expected_impact_quantified. "
              "If omitted, a generic placeholder is used.",
     )
+    ap.add_argument(
+        "--control_steps", type=int, default=None,
+        help="Override config.control_steps (episode length). Not an "
+             "algorithm deviation, so no --override_reason required.",
+    )
+    ap.add_argument(
+        "--seed", type=int, default=None,
+        help="Override config.seed (MPPIPlanner sampler RNG). Useful for "
+             "multi-seed variance studies. Not an algorithm deviation, so "
+             "no --override_reason required.",
+    )
     args = ap.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -83,31 +139,12 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     cfg = OmegaConf.load(args.config)
-    # Track any runtime overrides so summary.json can record a config_deviation
-    # block. This protects against silently changing the algorithm under the
-    # rug — every deviation must be explicitly flagged + justified by caller.
-    config_deviation = {"changed": [], "reason": None, "expected_impact_quantified": None}
-    if args.n_sample is not None and int(args.n_sample) != int(cfg.n_sample):
-        config_deviation["changed"].append(
-            f"n_sample: {int(cfg.n_sample)} -> {int(args.n_sample)}"
-        )
-        cfg.n_sample = int(args.n_sample)
+    # Every runtime override is applied here. Algorithm-level deviations
+    # (currently only --n_sample) go into the returned config_deviation
+    # block and require --override_reason; per-run knobs (control_steps,
+    # seed) mutate cfg silently because they don't change MPPI's algorithm.
+    config_deviation = _apply_cli_overrides(cfg, args)
     if config_deviation["changed"]:
-        if not args.override_reason:
-            raise SystemExit(
-                "ERROR: --n_sample (or other override) used without "
-                "--override_reason. Every config deviation must be justified "
-                "in writing so the audit trail in summary.json explains why."
-            )
-        config_deviation["reason"] = args.override_reason
-        config_deviation["expected_impact_quantified"] = (
-            args.expected_impact or
-            "Fewer samples per iteration means sparser coverage of action "
-            "space per plan_step. Iterative refinement (n_update_iter) "
-            "partially compensates. Empirical performance may differ from "
-            "the configured-default N. Replication at the configured N is "
-            "recommended for paper numbers."
-        )
         print(f"\n[!! config deviation] {config_deviation}\n")
     print(f"Effective config:\n{OmegaConf.to_yaml(cfg)}")
 
