@@ -129,3 +129,69 @@ def reference_clamp_actions(
     same per-dim bounds across the N and H axes.
     """
     return torch.clamp(act_seqs, lower, upper)
+
+
+def reference_trajectory_optimization(
+    state_cur: torch.Tensor,
+    init_act_seq: torch.Tensor,
+    *,
+    n_sample: int,
+    n_update_iter: int,
+    beta_filter: float,
+    noise_level: float,
+    reward_weight: float,
+    action_lower_lim: torch.Tensor,
+    action_upper_lim: torch.Tensor,
+    model_rollout_fn,
+    evaluate_traj_fn,
+    generator: torch.Generator | None = None,
+    device: str | torch.device | None = None,
+) -> torch.Tensor:
+    """Verbatim port of ``Planner.trajectory_optimization_mppi`` lines 428-483.
+
+    The reference's outer loop:
+
+      for _ in range(n_update_iter):
+          act_seqs = sample_action_sequences(act_seq)
+          state_seqs = model_rollout(state_cur, act_seqs)
+          reward_seqs = evaluate_traj(state_seqs, act_seqs)
+          act_seq = optimize_action_mppi(act_seqs, reward_seqs)
+
+    No cross-call state. ``model_rollout_fn`` is the caller-provided
+    dynamics. ``evaluate_traj_fn`` is the caller-provided reward.
+
+    Args:
+        state_cur: shape ``(state_dim,)`` (the reference uses ``(n_his, state_dim)``;
+            we collapse to a single state for our mock-env consistency tests
+            since our planner also passes a single latent).
+        init_act_seq: shape ``(H, A)`` initial guess.
+        model_rollout_fn: ``(state_cur, act_seqs) -> state_seqs`` of shape
+            ``(N, H, state_dim)``.
+        evaluate_traj_fn: ``(state_seqs, act_seqs) -> rewards`` of shape ``(N,)``.
+
+    Returns the converged ``act_seq`` of shape ``(H, A)``.
+    """
+    if device is None:
+        device = init_act_seq.device
+    act_seq = init_act_seq.clone().to(device)
+    state_cur = state_cur.to(device)
+    action_lower_lim = action_lower_lim.to(device)
+    action_upper_lim = action_upper_lim.to(device)
+
+    for _ in range(n_update_iter):
+        act_seqs = reference_sample_action_sequences(
+            act_seq,
+            n_sample=n_sample,
+            beta_filter=beta_filter,
+            noise_level=noise_level,
+            action_lower_lim=action_lower_lim,
+            action_upper_lim=action_upper_lim,
+            generator=generator,
+            device=device,
+        )
+        state_seqs = model_rollout_fn(state_cur, act_seqs)
+        reward_seqs = evaluate_traj_fn(state_seqs, act_seqs)
+        act_seq, _w = reference_optimize_action_mppi(
+            act_seqs, reward_seqs, reward_weight=reward_weight,
+        )
+    return act_seq
