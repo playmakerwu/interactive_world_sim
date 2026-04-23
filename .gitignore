@@ -109,6 +109,11 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+# Carve-out: our top-level Python package `env/` is the WM+CV wrapper, not a
+# virtualenv. Re-include the package source files (added 2026-04-22).
+!env/
+!env/__init__.py
+!env/*.py
 
 # Spyder project settings
 .spyderproject

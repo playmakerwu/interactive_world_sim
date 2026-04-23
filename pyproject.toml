@@ -13,6 +13,14 @@ license = {text = "MIT"}
 where = ["."]
 include = ["interactive_world_sim*"]
 
+[tool.pytest.ini_options]
+# Without this, pytest cannot import top-level packages that aren't in
+# `interactive_world_sim/` (e.g. `env/`, `rl/`). Explicit pythonpath="."
+# makes `pytest tests/` work from any CWD on any environment with the
+# deps installed.
+pythonpath = ["."]
+testpaths = ["tests"]
+
 [tool.ruff.lint]
 
 # Allow unused variables when underscore-prefixed.
