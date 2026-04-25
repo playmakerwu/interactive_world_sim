@@ -48,6 +48,7 @@ class PlanStats:
     final_iter_weights: torch.Tensor              # (N,) softmax weights at LAST iter
     n_cv_failures_final_iter: int                 # how many trajectories had CV fail
     iter_best_rewards: list[float] = field(default_factory=list)  # per-iter R.max()
+    iteration_log: list[dict[str, Any]] = field(default_factory=list)
 
 
 class MPPIPlanner:
@@ -201,11 +202,12 @@ class MPPIPlanner:
             z_current = z_current[0]
 
         iter_best_rewards: list[float] = []
+        iteration_log: list[dict[str, Any]] = []
         last_rewards: torch.Tensor | None = None
         last_weights: torch.Tensor | None = None
         last_state: dict[str, Any] | None = None
 
-        for _ in range(int(self.cfg.n_update_iter)):
+        for iter_idx in range(int(self.cfg.n_update_iter)):
             act_seqs = self.sample_action_sequences(act_seq)         # (N, H, A)
             rewards, state = self.evaluate_trajectories(z_current, act_seqs, goal_state)
             act_seq, weights = self.optimize_action_mppi(act_seqs, rewards)
@@ -213,6 +215,9 @@ class MPPIPlanner:
             last_rewards = rewards.detach().cpu()
             last_weights = weights.detach().cpu()
             last_state = state
+            iteration_log.append(
+                self._build_iteration_record(iter_idx, rewards, weights)
+            )
 
         n_fail = int((~last_state["success"]).sum().item()) if last_state else 0
         stats = PlanStats(
@@ -221,6 +226,7 @@ class MPPIPlanner:
             final_iter_weights=last_weights if last_weights is not None else torch.empty(0),
             n_cv_failures_final_iter=n_fail,
             iter_best_rewards=iter_best_rewards,
+            iteration_log=iteration_log,
         )
         self.last_stats = stats
         return act_seq, stats
@@ -230,12 +236,47 @@ class MPPIPlanner:
         z_current: torch.Tensor,
         goal_state: dict[str, Any],
         init_act_seq: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Convenience: run trajectory optimization, return only the first action."""
-        act_seq, _stats = self.trajectory_optimization(z_current, goal_state, init_act_seq)
-        return act_seq[0]
+        return_iteration_log: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[dict[str, Any]]]:
+        """Run trajectory optimization and return the first action.
+
+        Args:
+            z_current: current latent.
+            goal_state: scalar goal-state dict.
+            init_act_seq: optional initial action sequence.
+            return_iteration_log: when True, also return the per-iteration
+                reward/weight records captured during this plan step. Defaults
+                to False so older callers that expect only an action keep
+                working unchanged.
+        """
+        act_seq, stats = self.trajectory_optimization(z_current, goal_state, init_act_seq)
+        action = act_seq[0]
+        if return_iteration_log:
+            return action, stats.iteration_log
+        return action
 
     # ── helpers ──────────────────────────────────────────────────────
+
+    def _build_iteration_record(
+        self,
+        iter_idx: int,
+        rewards: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> dict[str, Any]:
+        """Create a CPU-side reward-debug record for one MPPI iteration."""
+        rewards_cpu = rewards.detach().cpu().float().clone()
+        weights_cpu = weights.detach().cpu().float().clone()
+        weighted_reward = (weights_cpu * rewards_cpu).sum()
+        return {
+            "iter": int(iter_idx),
+            "rewards_all": rewards_cpu,
+            "weights_all": weights_cpu,
+            "reward_max": float(rewards_cpu.max().item()),
+            "reward_min": float(rewards_cpu.min().item()),
+            "reward_mean": float(rewards_cpu.mean().item()),
+            "reward_std": float(rewards_cpu.std().item()),
+            "reward_softmax_weighted": float(weighted_reward.item()),
+        }
 
     def _validate_config(self) -> None:
         required = (

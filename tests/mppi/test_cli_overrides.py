@@ -58,6 +58,7 @@ def _default_cfg():
 def _default_args(**overrides):
     args = SimpleNamespace(
         n_sample=None,
+        n_update_iter=None,
         override_reason=None,
         expected_impact=None,
         control_steps=None,
@@ -129,18 +130,34 @@ def test_n_sample_override_with_reason_recorded():
     assert dev["expected_impact_quantified"] is not None
 
 
-# ─── 6. all three overrides together ───────────────────────────────────
+# ─── 6. --n_update_iter + --override_reason works and records deviation ─
 
-def test_all_three_overrides_compose():
+def test_n_update_iter_override_with_reason_recorded():
+    apply = _load_apply_cli_overrides()
+    cfg = _default_cfg()
+    dev = apply(cfg, _default_args(
+        n_update_iter=3,
+        override_reason="visualization smoke test",
+    ))
+    assert int(cfg.n_update_iter) == 3
+    assert dev["changed"] == ["n_update_iter: 5 -> 3"]
+    assert dev["reason"] == "visualization smoke test"
+
+
+# ─── 7. all four overrides together ────────────────────────────────────
+
+def test_all_four_overrides_compose():
     apply = _load_apply_cli_overrides()
     cfg = _default_cfg()
     dev = apply(cfg, _default_args(
         control_steps=100,
         seed=7,
         n_sample=16,
+        n_update_iter=3,
         override_reason="local VRAM budget",
     ))
     assert int(cfg.control_steps) == 100
     assert int(cfg.seed) == 7
     assert int(cfg.n_sample) == 16
-    assert dev["changed"] == ["n_sample: 100 -> 16"]
+    assert int(cfg.n_update_iter) == 3
+    assert dev["changed"] == ["n_sample: 100 -> 16", "n_update_iter: 5 -> 3"]

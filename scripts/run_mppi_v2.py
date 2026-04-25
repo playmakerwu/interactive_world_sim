@@ -22,6 +22,7 @@ import math
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -40,8 +41,8 @@ def _apply_cli_overrides(cfg, args) -> dict:
     """Apply CLI overrides to the loaded OmegaConf in place.
 
     Returns a ``config_deviation`` dict (always with the same shape).
-    Only ``--n_sample`` counts as an algorithm deviation requiring an
-    explicit ``--override_reason``; ``--control_steps`` and ``--seed``
+    ``--n_sample`` and ``--n_update_iter`` count as algorithm deviations
+    requiring an explicit ``--override_reason``; ``--control_steps`` and ``--seed``
     are legitimate per-run knobs (episode length and which run variant)
     that don't change MPPI's algorithmic behavior.
 
@@ -60,11 +61,19 @@ def _apply_cli_overrides(cfg, args) -> dict:
             f"n_sample: {int(cfg.n_sample)} -> {int(args.n_sample)}"
         )
         cfg.n_sample = int(args.n_sample)
+    if (
+        getattr(args, "n_update_iter", None) is not None
+        and int(args.n_update_iter) != int(cfg.n_update_iter)
+    ):
+        config_deviation["changed"].append(
+            f"n_update_iter: {int(cfg.n_update_iter)} -> {int(args.n_update_iter)}"
+        )
+        cfg.n_update_iter = int(args.n_update_iter)
 
     if config_deviation["changed"]:
         if not getattr(args, "override_reason", None):
             raise SystemExit(
-                "ERROR: --n_sample (or other algorithm-level override) used "
+                "ERROR: algorithm-level override used "
                 "without --override_reason. Every config deviation must be "
                 "justified in writing so the audit trail in summary.json "
                 "explains why."
@@ -72,11 +81,10 @@ def _apply_cli_overrides(cfg, args) -> dict:
         config_deviation["reason"] = args.override_reason
         config_deviation["expected_impact_quantified"] = (
             getattr(args, "expected_impact", None) or
-            "Fewer samples per iteration means sparser coverage of action "
-            "space per plan_step. Iterative refinement (n_update_iter) "
-            "partially compensates. Empirical performance may differ from "
-            "the configured-default N. Replication at the configured N is "
-            "recommended for paper numbers."
+            "This run changed one or more algorithm-level MPPI knobs for "
+            "runtime or ablation reasons. Empirical performance may differ "
+            "from the configured-default MPPI setting. Replication at the "
+            "configured defaults is recommended for paper numbers."
         )
     return config_deviation
 
@@ -94,6 +102,204 @@ def _write_mp4(frames: list[np.ndarray], out_path: Path, fps: int = 8) -> None:
         vw.release()
 
 
+ITER_HEATMAP_STATS = {
+    "reward_softmax_weighted": "softmax-weighted mean reward",
+    "reward_max": "best reward",
+    "reward_mean": "sample mean reward",
+    "reward_min": "worst reward",
+    "reward_std": "sample reward std",
+}
+
+
+def _distance_to_goal_px(row: dict[str, Any], goal: dict[str, Any]) -> float | None:
+    if not row.get("cv_success") or row.get("cx") is None or row.get("cy") is None:
+        return None
+    return math.sqrt((float(row["cx"]) - float(goal["cx"])) ** 2 +
+                     (float(row["cy"]) - float(goal["cy"])) ** 2)
+
+
+def _iteration_metric_matrix(
+    iteration_logs: list[list[dict[str, Any]]],
+    metric: str,
+) -> np.ndarray:
+    if metric not in ITER_HEATMAP_STATS:
+        raise ValueError(
+            f"unknown iteration heatmap metric {metric!r}; "
+            f"choose one of {sorted(ITER_HEATMAP_STATS)}"
+        )
+    if not iteration_logs:
+        return np.empty((0, 0), dtype=np.float32)
+
+    n_steps = len(iteration_logs)
+    n_iter = max((len(step_log) for step_log in iteration_logs), default=0)
+    mat = np.full((n_iter, n_steps), np.nan, dtype=np.float32)
+    for step_idx, step_log in enumerate(iteration_logs):
+        for fallback_iter, rec in enumerate(step_log):
+            iter_idx = int(rec.get("iter", fallback_iter))
+            if 0 <= iter_idx < n_iter:
+                mat[iter_idx, step_idx] = float(rec[metric])
+    return mat
+
+
+def _plot_plan_step_iteration_trace(
+    step_idx: int,
+    step_log: list[dict[str, Any]],
+    final_row: dict[str, Any],
+    goal: dict[str, Any],
+    out_path: Path,
+) -> None:
+    if not step_log:
+        return
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator
+
+    iterations = np.array([int(rec["iter"]) for rec in step_log], dtype=int)
+    softmax_reward = np.array(
+        [float(rec["reward_softmax_weighted"]) for rec in step_log], dtype=np.float32
+    )
+    reward_max = np.array([float(rec["reward_max"]) for rec in step_log], dtype=np.float32)
+    reward_mean = np.array([float(rec["reward_mean"]) for rec in step_log], dtype=np.float32)
+    reward_std = np.array([float(rec["reward_std"]) for rec in step_log], dtype=np.float32)
+
+    final_reward = final_row.get("reward")
+    final_reward_str = "nan" if final_reward is None else f"{float(final_reward):+.4f}"
+    dist = _distance_to_goal_px(final_row, goal)
+    dist_str = "nan" if dist is None else f"{dist:.1f}"
+
+    fig, ax = plt.subplots(figsize=(7.4, 4.4))
+    fig.suptitle(f"Plan step {step_idx:03d}: iteration reward trace", fontsize=13, y=0.98)
+    ax.set_title(
+        f"final action reward = {final_reward_str}, distance to goal = {dist_str} px",
+        fontsize=9,
+        color="dimgray",
+        pad=8,
+    )
+
+    ax.fill_between(
+        iterations,
+        reward_mean - reward_std,
+        reward_mean + reward_std,
+        color="tab:blue",
+        alpha=0.14,
+        label="sample mean +/- 1 std",
+        linewidth=0,
+    )
+    ax.plot(
+        iterations,
+        softmax_reward,
+        color="tab:blue",
+        linewidth=2.4,
+        marker="o",
+        label="softmax-weighted mean",
+    )
+    ax.plot(
+        iterations,
+        reward_max,
+        color="tab:cyan",
+        linewidth=1.8,
+        linestyle="--",
+        marker="s",
+        label="best sample",
+    )
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Reward")
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    if len(iterations) <= 12:
+        ax.set_xticks(iterations)
+    ax.grid(alpha=0.25)
+    ax.legend(loc="upper left", fontsize=9, framealpha=0.9)
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_iteration_heatmap(
+    iteration_logs: list[list[dict[str, Any]]],
+    cfg,
+    out_path: Path,
+    metric: str = "reward_softmax_weighted",
+) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator
+
+    mat = _iteration_metric_matrix(iteration_logs, metric)
+    if mat.size == 0:
+        return
+
+    fig, ax = plt.subplots(figsize=(9.0, 4.8))
+    im = ax.imshow(mat, origin="lower", aspect="auto", interpolation="nearest", cmap="viridis")
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label(ITER_HEATMAP_STATS[metric])
+
+    ax.set_title("Reward refinement across plan_steps and iterations", fontsize=13, pad=18)
+    ax.set_xlabel("Control step")
+    ax.set_ylabel("Iteration")
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+    if mat.shape[0] <= 12:
+        ax.set_yticks(np.arange(mat.shape[0]))
+    if mat.shape[1] <= 20:
+        ax.set_xticks(np.arange(mat.shape[1]))
+
+    cfg_text = (
+        f"N={int(cfg.n_sample)}, n_iter={int(cfg.n_update_iter)}, "
+        f"sigma={float(cfg.noise_level):g}, reward_weight={float(cfg.reward_weight):g}, "
+        f"beta={float(cfg.beta_filter):g}"
+    )
+    ax.text(
+        0.99, 1.02, cfg_text,
+        transform=ax.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=9,
+        color="dimgray",
+    )
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _write_iteration_visualizations(
+    iteration_logs: list[list[dict[str, Any]]],
+    per_step: list[dict[str, Any]],
+    goal: dict[str, Any],
+    cfg,
+    out_dir: Path,
+    heatmap_stat: str = "reward_softmax_weighted",
+) -> dict[str, str]:
+    """Write per-plan-step iteration traces and the aggregate heatmap."""
+    if not iteration_logs:
+        return {}
+
+    iter_dir = out_dir / "iter_viz"
+    iter_dir.mkdir(parents=True, exist_ok=True)
+    for step_idx, step_log in enumerate(iteration_logs):
+        final_row = per_step[step_idx + 1] if step_idx + 1 < len(per_step) else {}
+        _plot_plan_step_iteration_trace(
+            step_idx,
+            step_log,
+            final_row,
+            goal,
+            iter_dir / f"plan_step_{step_idx:03d}.png",
+        )
+
+    heatmap_path = out_dir / "iter_reward_heatmap.png"
+    _plot_iteration_heatmap(iteration_logs, cfg, heatmap_path, metric=heatmap_stat)
+    return {
+        "iteration_log": str(out_dir / "iteration_log.pt"),
+        "per_plan_step_dir": str(iter_dir),
+        "heatmap": str(heatmap_path),
+        "heatmap_stat": heatmap_stat,
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="configs/mppi/default.yaml")
@@ -108,6 +314,12 @@ def main() -> None:
              "local runs). When used, summary.json records a config_deviation "
              "block listing the override and its rationale (which the caller "
              "must pass via --override_reason).",
+    )
+    ap.add_argument(
+        "--n_update_iter", type=int, default=None,
+        help="Override config.n_update_iter at runtime (for visualization "
+             "smoke tests or explicit ablations). This is an algorithm-level "
+             "override and therefore requires --override_reason.",
     )
     ap.add_argument(
         "--override_reason", type=str, default=None,
@@ -130,6 +342,12 @@ def main() -> None:
         help="Override config.seed (MPPIPlanner sampler RNG). Useful for "
              "multi-seed variance studies. Not an algorithm deviation, so "
              "no --override_reason required.",
+    )
+    ap.add_argument(
+        "--iter_heatmap_stat", default="reward_softmax_weighted",
+        choices=sorted(ITER_HEATMAP_STATS.keys()),
+        help="Iteration-log statistic to color in iter_reward_heatmap.png. "
+             "Default is the softmax-weighted mean reward.",
     )
     args = ap.parse_args()
 
@@ -167,6 +385,7 @@ def main() -> None:
     # ── main control loop ──
     trajectory_latents: list[torch.Tensor] = [z.cpu().clone()]
     action_history: list[torch.Tensor] = []
+    iteration_logs: list[list[dict[str, Any]]] = []
     rgb_frames: list[np.ndarray] = []
     per_step: list[dict] = []
 
@@ -190,7 +409,9 @@ def main() -> None:
     t0_run = time.time()
     for t in range(int(cfg.control_steps)):
         t0_step = time.time()
-        a = planner.plan_step(z, goal)              # (action_dim,)
+        a, iter_log = planner.plan_step(
+            z, goal, return_iteration_log=True,
+        )                                           # (action_dim,), list[n_iter]
         z = env.dynamics_step(z, a)                 # (C, H_lat, W_lat)
         rgb_t = env.decode(z)
         rgb_t_u8 = (rgb_t.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8).transpose(1, 2, 0)
@@ -200,6 +421,7 @@ def main() -> None:
 
         trajectory_latents.append(z.cpu().clone())
         action_history.append(a.detach().cpu().clone())
+        iteration_logs.append(iter_log)
         rgb_frames.append(rgb_t_u8)
         per_step.append({
             "t": t + 1,
@@ -228,6 +450,7 @@ def main() -> None:
     torch.save(torch.stack(trajectory_latents), out_dir / "trajectory_latents.pt")
     torch.save(torch.stack(action_history), out_dir / "action_history.pt")
     torch.save(trajectory_latents[0], out_dir / "initial_latent.pt")
+    torch.save(iteration_logs, out_dir / "iteration_log.pt")
     _write_mp4(rgb_frames, out_dir / "trajectory.mp4")
 
     # reward curve
@@ -321,6 +544,14 @@ def main() -> None:
         "wall_per_step_s": round(wall_total / max(1, int(cfg.control_steps)), 3),
         "per_step": per_step,
     }
+    summary["iteration_reward_viz"] = _write_iteration_visualizations(
+        iteration_logs,
+        per_step,
+        goal,
+        cfg,
+        out_dir,
+        heatmap_stat=args.iter_heatmap_stat,
+    )
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
 
     # If the run involved any config deviation, also drop a cloud-ready
