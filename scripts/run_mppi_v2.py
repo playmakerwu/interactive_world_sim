@@ -55,6 +55,8 @@ def _apply_cli_overrides(cfg, args) -> dict:
         cfg.control_steps = int(args.control_steps)
     if getattr(args, "seed", None) is not None:
         cfg.seed = int(args.seed)
+    if getattr(args, "decode_batch_size", None) is not None:
+        cfg.decode_batch_size = int(args.decode_batch_size)
 
     if getattr(args, "n_sample", None) is not None and int(args.n_sample) != int(cfg.n_sample):
         config_deviation["changed"].append(
@@ -344,6 +346,12 @@ def main() -> None:
              "no --override_reason required.",
     )
     ap.add_argument(
+        "--decode_batch_size", type=int, default=None,
+        help="Memory-only override for decoding sampled final latents during "
+             "MPPI reward evaluation. Smaller values reduce peak VRAM without "
+             "changing N, horizon, or the sampled action set.",
+    )
+    ap.add_argument(
         "--iter_heatmap_stat", default="reward_softmax_weighted",
         choices=sorted(ITER_HEATMAP_STATS.keys()),
         help="Iteration-log statistic to color in iter_reward_heatmap.png. "
@@ -553,6 +561,16 @@ def main() -> None:
         heatmap_stat=args.iter_heatmap_stat,
     )
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+
+    # Combined per-frame trajectory + reward-iteration video. Reads back
+    # trajectory.mp4, summary.json, and iteration_log.pt that were just
+    # written, so the call must come AFTER the artifact dump above.
+    try:
+        from rl.visualization.combined_video import render_combined_video
+        combined_path = render_combined_video(out_dir, fps=8)
+        print(f"  combined viz: {combined_path}")
+    except Exception as exc:  # noqa: BLE001 — viz is best-effort, must not nuke a successful run
+        print(f"  WARN: combined video render failed: {exc!r}")
 
     # If the run involved any config deviation, also drop a cloud-ready
     # reproduction script that uses the configured-default values.

@@ -142,7 +142,7 @@ def test_iteration_log_structure():
 
     assert action.shape == (env.action_dim,)
     assert len(log) == int(cfg.n_update_iter)
-    required = {
+    scalar_or_tensor_keys = {
         "iter",
         "rewards_all",
         "weights_all",
@@ -152,6 +152,21 @@ def test_iteration_log_structure():
         "reward_std",
         "reward_softmax_weighted",
     }
+    optional_per_sample_keys = {
+        "sample_cx",
+        "sample_cy",
+        "sample_sin_theta",
+        "sample_cos_theta",
+        "sample_success",
+    }
+    optional_top_k_keys = {
+        "top_k_intermediate_cx",
+        "top_k_intermediate_cy",
+        "top_k_intermediate_success",
+        "top_k_indices",
+        "top_k_rewards",
+    }
+    required = scalar_or_tensor_keys | optional_per_sample_keys | optional_top_k_keys
     for iter_idx, rec in enumerate(log):
         assert set(rec) == required
         assert rec["iter"] == iter_idx
@@ -162,8 +177,103 @@ def test_iteration_log_structure():
         assert torch.all(torch.isfinite(rec["rewards_all"]))
         assert torch.all(torch.isfinite(rec["weights_all"]))
         assert float(rec["weights_all"].sum()) == pytest.approx(1.0, abs=1e-5)
-        for key in required - {"iter", "rewards_all", "weights_all"}:
+        for key in scalar_or_tensor_keys - {"iter", "rewards_all", "weights_all"}:
             assert torch.isfinite(torch.tensor(rec[key]))
+        # MockEnv returns a {_state, success} dict only — no cx/cy/sin/cos —
+        # so per-sample CV fields should be None for this test fixture.
+        for key in optional_per_sample_keys:
+            assert rec[key] is None, (
+                f"MockEnv state lacks {key}; planner should record None"
+            )
+        # Top-K intermediate fields are only patched on the last iter when
+        # the env can provide CV; MockEnv can't, so all iterations stay None.
+        for key in optional_top_k_keys:
+            assert rec[key] is None, (
+                f"MockEnv can't provide CV; top_k field {key} should be None"
+            )
+
+
+class CVMockEnv(MockEnv):
+    """MockEnv variant whose ``estimate_from_latent`` also returns cx/cy/sin/cos.
+
+    Lets us test the planner's per-sample CV capture in isolation, without
+    needing the WM or the real CVLabeler. Maps the first 4 latent dims to
+    ``[cx, cy, sin_theta, cos_theta]``.
+    """
+
+    def estimate_from_latent(self, z: torch.Tensor) -> dict:
+        z_flat = z.squeeze(-1).squeeze(-1)
+        single = z_flat.dim() == 1
+        if single:
+            z_flat = z_flat.unsqueeze(0)
+        N, D = z_flat.shape
+        assert D >= 4, "CVMockEnv needs >=4 action dims to fake CV state"
+        out = {
+            "_state": z_flat if not single else z_flat[0],
+            "cx": z_flat[:, 0].clone(),
+            "cy": z_flat[:, 1].clone(),
+            "sin_theta": z_flat[:, 2].clone(),
+            "cos_theta": z_flat[:, 3].clone(),
+            "success": torch.ones(N, dtype=torch.bool),
+        }
+        if single:
+            out = {k: (v[0] if isinstance(v, torch.Tensor) and v.dim() > 0 else v)
+                   for k, v in out.items()}
+            out["_state"] = z_flat[0]
+            out["success"] = torch.tensor(True)
+        return out
+
+
+def test_iteration_log_captures_per_sample_cv_when_env_provides_it():
+    env = CVMockEnv()
+    cfg = _cfg(n_update_iter=2, n_sample=6)
+    planner = MPPIPlanner(env, cfg)
+
+    _action, log = planner.plan_step(_z0(), _goal(), return_iteration_log=True)
+
+    for rec in log:
+        for key in ("sample_cx", "sample_cy", "sample_sin_theta", "sample_cos_theta"):
+            assert isinstance(rec[key], torch.Tensor)
+            assert rec[key].shape == (int(cfg.n_sample),)
+            assert rec[key].device.type == "cpu"
+            assert torch.all(torch.isfinite(rec[key]))
+        assert isinstance(rec["sample_success"], torch.Tensor)
+        assert rec["sample_success"].shape == (int(cfg.n_sample),)
+        assert rec["sample_success"].dtype == torch.bool
+
+
+def test_iteration_log_last_iter_captures_top_k_intermediate_trajectories():
+    """Last iteration of each plan_step gets top-K intermediate CV polylines."""
+    env = CVMockEnv()
+    cfg = _cfg(n_update_iter=3, n_sample=12, n_look_ahead=4)
+    planner = MPPIPlanner(env, cfg)
+
+    _action, log = planner.plan_step(_z0(), _goal(), return_iteration_log=True)
+
+    K_expected = min(10, int(cfg.n_sample))
+    Hp1 = int(cfg.n_look_ahead) + 1
+
+    # Earlier iterations: top_k_* not patched -> None
+    for rec in log[:-1]:
+        for key in ("top_k_intermediate_cx", "top_k_intermediate_cy",
+                    "top_k_intermediate_success", "top_k_indices", "top_k_rewards"):
+            assert rec[key] is None, f"non-last iter should not carry {key}"
+
+    # Last iteration: shapes and ordering correct
+    last = log[-1]
+    assert isinstance(last["top_k_intermediate_cx"], torch.Tensor)
+    assert last["top_k_intermediate_cx"].shape == (K_expected, Hp1)
+    assert last["top_k_intermediate_cy"].shape == (K_expected, Hp1)
+    assert last["top_k_intermediate_success"].shape == (K_expected, Hp1)
+    assert last["top_k_intermediate_success"].dtype == torch.bool
+    assert last["top_k_indices"].shape == (K_expected,)
+    assert last["top_k_indices"].dtype == torch.long
+    assert last["top_k_rewards"].shape == (K_expected,)
+    # Top-K rewards must be non-increasing (descending sort)
+    rewards = last["top_k_rewards"]
+    assert torch.all(rewards[:-1] >= rewards[1:]), (
+        "top_k_rewards must be in descending order"
+    )
 
 
 def test_iteration_log_stats_math_known_rewards():

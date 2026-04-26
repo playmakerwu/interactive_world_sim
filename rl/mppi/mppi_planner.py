@@ -160,13 +160,48 @@ class MPPIPlanner:
         del traj
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        state = self.env.estimate_from_latent(z_final)  # batched dict
+        state = self._estimate_final_states(z_final)  # batched dict
         rewards = self.env.compute_reward(
             state, goal_state,
             image_diagonal=self.env.image_diagonal,
             cv_fail_penalty=float(self.cfg.cv_fail_penalty),
         )
         return rewards, state
+
+    def _estimate_final_states(self, z_final: torch.Tensor) -> dict[str, Any]:
+        """Decode/CV-estimate final latents, optionally in memory-safe chunks."""
+        decode_batch_size = int(getattr(self.cfg, "decode_batch_size", 0) or 0)
+        if decode_batch_size <= 0 or decode_batch_size >= z_final.shape[0]:
+            return self.env.estimate_from_latent(z_final)
+
+        chunks: list[dict[str, Any]] = []
+        for start in range(0, z_final.shape[0], decode_batch_size):
+            end = min(start + decode_batch_size, z_final.shape[0])
+            chunks.append(self.env.estimate_from_latent(z_final[start:end]))
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        return self._cat_state_chunks(chunks)
+
+    @staticmethod
+    def _cat_state_chunks(chunks: list[dict[str, Any]]) -> dict[str, Any]:
+        if not chunks:
+            return {}
+        out: dict[str, Any] = {}
+        for key in chunks[0].keys():
+            vals = [chunk[key] for chunk in chunks]
+            if all(isinstance(v, torch.Tensor) for v in vals):
+                out[key] = torch.cat([
+                    v if v.dim() > 0 else v.unsqueeze(0) for v in vals
+                ], dim=0)
+            else:
+                combined = []
+                for v in vals:
+                    if isinstance(v, list):
+                        combined.extend(v)
+                    else:
+                        combined.append(v)
+                out[key] = combined
+        return out
 
     def trajectory_optimization(
         self,
@@ -206,6 +241,8 @@ class MPPIPlanner:
         last_rewards: torch.Tensor | None = None
         last_weights: torch.Tensor | None = None
         last_state: dict[str, Any] | None = None
+        last_act_seqs: torch.Tensor | None = None
+        last_rewards_full: torch.Tensor | None = None  # GPU copy for re-roll
 
         for iter_idx in range(int(self.cfg.n_update_iter)):
             act_seqs = self.sample_action_sequences(act_seq)         # (N, H, A)
@@ -215,9 +252,23 @@ class MPPIPlanner:
             last_rewards = rewards.detach().cpu()
             last_weights = weights.detach().cpu()
             last_state = state
+            last_act_seqs = act_seqs
+            last_rewards_full = rewards
             iteration_log.append(
-                self._build_iteration_record(iter_idx, rewards, weights)
+                self._build_iteration_record(iter_idx, rewards, weights, state=state)
             )
+
+        # After the optimization loop, re-roll the top-K trajectories from
+        # the last iteration and CV-label every step along the rollout, so
+        # downstream visualization can draw full predicted polylines (not
+        # just endpoints). Cheap: K << N. None when env can't provide CV
+        # (mock envs in unit tests).
+        top_k_record = self._compute_top_k_intermediate_cv(
+            z_current, last_act_seqs, last_rewards_full,
+            k=int(getattr(self.cfg, "top_k_polylines", 10)),
+        )
+        if top_k_record is not None and iteration_log:
+            iteration_log[-1].update(top_k_record)
 
         n_fail = int((~last_state["success"]).sum().item()) if last_state else 0
         stats = PlanStats(
@@ -257,16 +308,96 @@ class MPPIPlanner:
 
     # ── helpers ──────────────────────────────────────────────────────
 
+    def _compute_top_k_intermediate_cv(
+        self,
+        z_current: torch.Tensor,
+        act_seqs: torch.Tensor | None,
+        rewards: torch.Tensor | None,
+        k: int = 10,
+    ) -> dict[str, Any] | None:
+        """Re-roll top-K trajectories (by reward) and CV-label every step.
+
+        Returns a dict suitable for ``iteration_log[-1].update(...)`` with
+        keys ``top_k_intermediate_cx``, ``top_k_intermediate_cy``,
+        ``top_k_intermediate_success`` (each ``(K, H+1)``), plus
+        ``top_k_indices`` and ``top_k_rewards`` (each ``(K,)``).
+
+        Returns ``None`` when:
+          * inputs are missing (no last iteration captured), or
+          * the env's ``estimate_from_latent`` does not provide
+            ``cx, cy, success`` (mock envs).
+        """
+        if act_seqs is None or rewards is None:
+            return None
+        N = act_seqs.shape[0]
+        actual_k = min(int(k), N)
+        rewards_cpu = rewards.detach().cpu().float()
+        topk_indices = torch.argsort(rewards_cpu, descending=True)[:actual_k]
+
+        top_act_seqs = act_seqs[topk_indices.to(act_seqs.device)]  # (K, H, A)
+        z0_batch = z_current.unsqueeze(0).expand(actual_k, -1, -1, -1).contiguous()
+        with torch.no_grad():
+            traj = self.env.rollout(z0_batch, top_act_seqs)  # (K, H+1, C, h, w)
+        K, Hp1 = traj.shape[:2]
+        flat = traj.reshape(K * Hp1, *traj.shape[2:])
+        del traj
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Reuse the chunked decode+CV path so ``decode_batch_size`` is honoured.
+        state = self._estimate_final_states(flat)
+
+        if not all(key in state for key in ("cx", "cy", "success")):
+            return None
+
+        cx_flat = state["cx"].detach().cpu().float()
+        cy_flat = state["cy"].detach().cpu().float()
+        success_flat = state["success"].detach().cpu()
+        # Some mock envs return dim-0 tensors when batch-size 1; guard.
+        if cx_flat.dim() == 0:
+            cx_flat = cx_flat.unsqueeze(0)
+            cy_flat = cy_flat.unsqueeze(0)
+            success_flat = success_flat.unsqueeze(0)
+
+        return {
+            "top_k_intermediate_cx": cx_flat.reshape(K, Hp1),
+            "top_k_intermediate_cy": cy_flat.reshape(K, Hp1),
+            "top_k_intermediate_success": success_flat.reshape(K, Hp1),
+            "top_k_indices": topk_indices.long(),
+            "top_k_rewards": rewards_cpu[topk_indices],
+        }
+
     def _build_iteration_record(
         self,
         iter_idx: int,
         rewards: torch.Tensor,
         weights: torch.Tensor,
+        state: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Create a CPU-side reward-debug record for one MPPI iteration."""
+        """Create a CPU-side reward-debug record for one MPPI iteration.
+
+        ``state`` is the per-sample CV pose dict produced by
+        ``evaluate_trajectories`` (keys ``cx, cy, sin_theta, cos_theta,
+        success``). When provided, those tensors are persisted (CPU clone)
+        so downstream visualization can plot per-sample candidate
+        endpoints. When the env's ``estimate_from_latent`` returns a
+        different schema (e.g. mock envs), the per-sample fields default
+        to ``None``.
+        """
         rewards_cpu = rewards.detach().cpu().float().clone()
         weights_cpu = weights.detach().cpu().float().clone()
         weighted_reward = (weights_cpu * rewards_cpu).sum()
+
+        sample_cx = sample_cy = sample_sin = sample_cos = sample_success = None
+        if state is not None and all(
+            k in state for k in ("cx", "cy", "sin_theta", "cos_theta", "success")
+        ):
+            sample_cx = state["cx"].detach().cpu().float().clone()
+            sample_cy = state["cy"].detach().cpu().float().clone()
+            sample_sin = state["sin_theta"].detach().cpu().float().clone()
+            sample_cos = state["cos_theta"].detach().cpu().float().clone()
+            sample_success = state["success"].detach().cpu().clone()
+
         return {
             "iter": int(iter_idx),
             "rewards_all": rewards_cpu,
@@ -276,6 +407,19 @@ class MPPIPlanner:
             "reward_mean": float(rewards_cpu.mean().item()),
             "reward_std": float(rewards_cpu.std().item()),
             "reward_softmax_weighted": float(weighted_reward.item()),
+            "sample_cx": sample_cx,
+            "sample_cy": sample_cy,
+            "sample_sin_theta": sample_sin,
+            "sample_cos_theta": sample_cos,
+            "sample_success": sample_success,
+            # Top-K predicted trajectories — populated by
+            # _compute_top_k_intermediate_cv on the LAST iteration only,
+            # patched in via iteration_log[-1].update(...) post-loop.
+            "top_k_intermediate_cx": None,
+            "top_k_intermediate_cy": None,
+            "top_k_intermediate_success": None,
+            "top_k_indices": None,
+            "top_k_rewards": None,
         }
 
     def _validate_config(self) -> None:
