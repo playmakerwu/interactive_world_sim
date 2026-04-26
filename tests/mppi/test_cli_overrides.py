@@ -63,6 +63,8 @@ def _default_args(**overrides):
         expected_impact=None,
         control_steps=None,
         seed=None,
+        decode_batch_size=None,
+        horizon=None,
     )
     for k, v in overrides.items():
         setattr(args, k, v)
@@ -106,7 +108,18 @@ def test_seed_override_takes_effect():
     assert dev["changed"] == []
 
 
-# ─── 4. --n_sample without --override_reason raises ─────────────────────
+# ─── 4. --decode_batch_size propagates without deviation ───────────────
+
+def test_decode_batch_size_override_takes_effect():
+    apply = _load_apply_cli_overrides()
+    cfg = _default_cfg()
+    dev = apply(cfg, _default_args(decode_batch_size=8))
+    assert int(cfg.decode_batch_size) == 8
+    # decode_batch_size is a memory-only knob, not an algorithm deviation.
+    assert dev["changed"] == []
+
+
+# ─── 5. --n_sample without --override_reason raises ─────────────────────
 
 def test_n_sample_override_requires_reason():
     apply = _load_apply_cli_overrides()
@@ -115,7 +128,7 @@ def test_n_sample_override_requires_reason():
         apply(cfg, _default_args(n_sample=16))
 
 
-# ─── 5. --n_sample + --override_reason works and records deviation ─────
+# ─── 6. --n_sample + --override_reason works and records deviation ─────
 
 def test_n_sample_override_with_reason_recorded():
     apply = _load_apply_cli_overrides()
@@ -130,7 +143,7 @@ def test_n_sample_override_with_reason_recorded():
     assert dev["expected_impact_quantified"] is not None
 
 
-# ─── 6. --n_update_iter + --override_reason works and records deviation ─
+# ─── 7. --n_update_iter + --override_reason works and records deviation ─
 
 def test_n_update_iter_override_with_reason_recorded():
     apply = _load_apply_cli_overrides()
@@ -144,9 +157,9 @@ def test_n_update_iter_override_with_reason_recorded():
     assert dev["reason"] == "visualization smoke test"
 
 
-# ─── 7. all four overrides together ────────────────────────────────────
+# ─── 8. all five overrides together ────────────────────────────────────
 
-def test_all_four_overrides_compose():
+def test_all_five_overrides_compose():
     apply = _load_apply_cli_overrides()
     cfg = _default_cfg()
     dev = apply(cfg, _default_args(
@@ -154,10 +167,58 @@ def test_all_four_overrides_compose():
         seed=7,
         n_sample=16,
         n_update_iter=3,
+        decode_batch_size=8,
         override_reason="local VRAM budget",
     ))
     assert int(cfg.control_steps) == 100
     assert int(cfg.seed) == 7
     assert int(cfg.n_sample) == 16
     assert int(cfg.n_update_iter) == 3
+    assert int(cfg.decode_batch_size) == 8
     assert dev["changed"] == ["n_sample: 100 -> 16", "n_update_iter: 5 -> 3"]
+
+
+# ─── 9. --horizon override propagates with audit guard ─────────────────
+
+def test_horizon_override_propagates():
+    apply = _load_apply_cli_overrides()
+    cfg = _default_cfg()
+    dev = apply(cfg, _default_args(horizon=20, override_reason="long horizon ablation"))
+    assert int(cfg.n_look_ahead) == 20
+    assert dev["changed"] == ["n_look_ahead: 10 -> 20"]
+    assert dev["reason"] == "long horizon ablation"
+
+
+def test_horizon_override_audit_guard_without_reason():
+    """--horizon != default must require --override_reason (algorithm
+    deviation, same audit guard as --n_sample / --n_update_iter)."""
+    apply = _load_apply_cli_overrides()
+    cfg = _default_cfg()
+    with pytest.raises(SystemExit):
+        apply(cfg, _default_args(horizon=20))
+
+
+def test_horizon_override_above_max_raises_value_error():
+    """--horizon 51 raises ValueError BEFORE the audit-guard check, so
+    the user gets a clear message about the cap rather than a misleading
+    'missing override_reason' error."""
+    apply = _load_apply_cli_overrides()
+    cfg = _default_cfg()
+    with pytest.raises(ValueError, match=r"\[1, 50\]"):
+        apply(cfg, _default_args(horizon=51, override_reason="trying very long horizon"))
+
+
+def test_horizon_override_below_min_raises_value_error():
+    apply = _load_apply_cli_overrides()
+    cfg = _default_cfg()
+    with pytest.raises(ValueError, match=r"\[1, 50\]"):
+        apply(cfg, _default_args(horizon=0, override_reason="boundary"))
+
+
+def test_horizon_equal_to_default_records_no_deviation():
+    """--horizon 10 (== config default) is a no-op; no audit guard fires."""
+    apply = _load_apply_cli_overrides()
+    cfg = _default_cfg()  # default has n_look_ahead=10
+    dev = apply(cfg, _default_args(horizon=10))
+    assert int(cfg.n_look_ahead) == 10
+    assert dev["changed"] == []

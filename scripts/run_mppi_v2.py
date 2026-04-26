@@ -71,6 +71,19 @@ def _apply_cli_overrides(cfg, args) -> dict:
             f"n_update_iter: {int(cfg.n_update_iter)} -> {int(args.n_update_iter)}"
         )
         cfg.n_update_iter = int(args.n_update_iter)
+    if getattr(args, "horizon", None) is not None:
+        h = int(args.horizon)
+        if h < 1 or h > 50:
+            raise ValueError(
+                f"--horizon must be in [1, 50] (drift has only been "
+                f"quantified up to 50; see env.pusht_wm_env.MAX_HORIZON). "
+                f"Got {h}."
+            )
+        if h != int(cfg.n_look_ahead):
+            config_deviation["changed"].append(
+                f"n_look_ahead: {int(cfg.n_look_ahead)} -> {h}"
+            )
+            cfg.n_look_ahead = h
 
     if config_deviation["changed"]:
         if not getattr(args, "override_reason", None):
@@ -350,6 +363,14 @@ def main() -> None:
         help="Memory-only override for decoding sampled final latents during "
              "MPPI reward evaluation. Smaller values reduce peak VRAM without "
              "changing N, horizon, or the sampled action set.",
+    )
+    ap.add_argument(
+        "--horizon", type=int, default=None,
+        help="Override config.n_look_ahead (planning horizon H). Range "
+             "[1, 50]; the IWS WM's internal sliding 10-frame attention "
+             "window handles long horizons natively. Algorithm-level "
+             "override, so requires --override_reason when set to a value "
+             "different from the config default.",
     )
     ap.add_argument(
         "--iter_heatmap_stat", default="reward_softmax_weighted",

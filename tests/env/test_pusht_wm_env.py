@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 import torch
 
-from env.pusht_wm_env import PUSHT_CAMERA_KEY, PushTWMEnv
+from env.pusht_wm_env import MAX_HORIZON, PUSHT_CAMERA_KEY, PushTWMEnv
 
 CKPT_PATH = Path("outputs/pusht_cam1/checkpoints/best.ckpt")
 SAMPLE_HDF5 = Path("data/mini/pusht/train/episode_3.hdf5")
@@ -200,6 +200,32 @@ def test_compute_reward_180_flip(env):
     }
     r = env.compute_reward(state, goal, image_diagonal=181.0)
     assert abs(float(r) - (-2.0)) < 1e-4, f"180-flip reward should be -2, got {r}"
+
+
+# ─── 7. rollout supports H up to MAX_HORIZON natively ─────────────────
+
+def test_rollout_long_horizons_succeed(env, sample_rgb_chw):
+    """The WM's internal sliding 10-frame window handles arbitrary H up
+    to MAX_HORIZON; the env layer just delegates. Verify shapes are
+    correct and no NaNs appear at H=10, 20, 50."""
+    z0 = env.encode(sample_rgb_chw)  # (C, H_lat, W_lat)
+    for H in (10, 20, 50):
+        actions = torch.zeros(1, H, env.action_dim, device=env.device)
+        traj = env.rollout(z0.unsqueeze(0), actions)
+        assert traj.shape == (1, H + 1, *z0.shape), (
+            f"H={H}: expected (1, {H+1}, {z0.shape}); got {tuple(traj.shape)}"
+        )
+        assert not torch.isnan(traj).any(), f"H={H}: NaN appeared in rollout"
+
+
+def test_rollout_horizon_above_max_raises(env, sample_rgb_chw):
+    """H > MAX_HORIZON raises a ValueError mentioning the cap so the
+    user sees why instead of silently launching a multi-hour rollout."""
+    z0 = env.encode(sample_rgb_chw)
+    H = MAX_HORIZON + 1
+    actions = torch.zeros(1, H, env.action_dim, device=env.device)
+    with pytest.raises(ValueError, match=str(MAX_HORIZON)):
+        env.rollout(z0.unsqueeze(0), actions)
 
 
 # ─── 6. load_initial_from_hdf5 enforces camera_1_color ─────────────────

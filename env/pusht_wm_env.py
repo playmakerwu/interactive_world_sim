@@ -37,6 +37,16 @@ DEFAULT_DIAGONAL = float(np.sqrt(DEFAULT_RES ** 2 + DEFAULT_RES ** 2))  # ≈ 18
 # regression of the pre-fix camera bug. Don't make this configurable.
 PUSHT_CAMERA_KEY = "camera_1_color"
 
+# Hard cap on the planning horizon supported by ``rollout``. The IWS
+# WM's ``DifferentiableDynamics.rollout`` already implements a sliding
+# 10-frame window internally (see ``rl/models/world_model.py``), so
+# rollouts at H up to 50 work natively without any chunking layer here.
+# We surface a ValueError beyond 50 because (a) drift quantification has
+# only been validated up to H=50 (see ``tests/env/test_rollout_drift.py``
+# + ``outputs/drift_report.json``) and (b) wall time grows linearly with
+# H, so an accidental H=10000 shouldn't silently spawn a multi-hour run.
+MAX_HORIZON = 50
+
 
 def _is_batched_latent(z: torch.Tensor) -> bool:
     """Latent shape is (C, H, W) unbatched or (B, C, H, W) batched."""
@@ -173,7 +183,23 @@ class PushTWMEnv:
             Latents ``(B, H+1, C, H_lat, W_lat)`` (or ``(H+1, ...)`` if
             input was unbatched). Index 0 is ``z0``; subsequent indices are
             the post-step latents.
+
+        Long horizons (H > 10) are supported natively by the underlying
+        ``DifferentiableDynamics.rollout``, which slides a 10-frame
+        attention window across the action sequence. ``H > MAX_HORIZON``
+        raises ValueError as a defensive cap — see the constant's
+        docstring above.
         """
+        horizon = actions.shape[-2]
+        if horizon > MAX_HORIZON:
+            raise ValueError(
+                f"PushTWMEnv.rollout supports H up to {MAX_HORIZON}; "
+                f"got H={horizon}. The IWS WM's internal sliding window "
+                f"would still produce an output, but drift past H={MAX_HORIZON} "
+                f"has not been quantified — running there silently risks "
+                f"reward signals dominated by WM hallucination."
+            )
+
         was_batched = _is_batched_latent(z0)
         if not was_batched:
             z0 = z0.unsqueeze(0)
