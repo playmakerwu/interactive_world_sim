@@ -21,11 +21,34 @@ import torch
 
 from rl.visualization.combined_video import (
     CANVAS_PX,
+    COMPOSITE_H,
+    COMPOSITE_W,
+    SIDE_PANEL_H,
+    SIDE_PANEL_W,
     UPSAMPLE_FACTOR,
     _compose_frame,
     _compute_shared_y_lim,
+    _render_gripper_arrow_panel,
     render_combined_video,
 )
+
+
+# ─── Demo stats fixture used by gripper-panel tests ────────────────────
+
+def _make_fake_demo_stats() -> dict:
+    """Synthetic demo_stats payload with WM-checkpoint-shaped normalizer."""
+    return {
+        "mean_per_dim": torch.tensor([0.15, 0.09, 0.16, -0.34], dtype=torch.float32),
+        "std_per_dim": torch.tensor([0.12, 0.08, 0.10, 0.07], dtype=torch.float32),
+        "max_magnitude_left": 0.4,
+        "max_magnitude_right": 0.5,
+        "std_magnitude_left": 0.15,
+        "std_magnitude_right": 0.12,
+        "normalizer": {
+            "scale": torch.tensor([3.98, 4.54, 4.03, 4.80], dtype=torch.float32),
+            "offset": torch.tensor([-0.45, +0.19, -0.45, +0.93], dtype=torch.float32),
+        },
+    }
 
 K_DEFAULT = 10
 H_DEFAULT = 5  # so H+1 = 6 polyline points per top-K trajectory
@@ -193,26 +216,27 @@ def test_compose_frame_draws_goal_and_current():
     per_step_row = {
         "t": 1, "reward": -0.4, "cv_success": True,
         "cx": 80.0, "cy": 80.0, "theta_deg": 0.0,
+        "action": [0.0, 0.0, 0.0, 0.0],
     }
     goal = {"cx": 30.0, "cy": 30.0, "theta_deg": 0.0}
     log = _make_iter_log_with_cv()
 
-    composed = _compose_frame(rgb, per_step_row, goal, log, frame_idx=1)
+    composed = _compose_frame(rgb, per_step_row, goal, log, frame_idx=1,
+                              demo_stats=_make_fake_demo_stats())
 
-    expected_w = CANVAS_PX * 2
-    expected_h = CANVAS_PX
-    assert composed.shape == (expected_h, expected_w, 3)
+    assert composed.shape == (COMPOSITE_H, COMPOSITE_W, 3)
     assert composed.dtype == np.uint8
 
-    # Left half = first CANVAS_PX cols
-    left = composed[:, :CANVAS_PX]
+    # RGB canvas (after the left side panel) lives at columns [SIDE_PANEL_W,
+    # SIDE_PANEL_W + CANVAS_PX).
+    rgb_canvas = composed[:, SIDE_PANEL_W:SIDE_PANEL_W + CANVAS_PX]
 
     # Goal at (30, 30) * 4 = (120, 120) in canvas — should contain red
-    goal_patch = left[120 - 8:120 + 8, 120 - 8:120 + 8]
+    goal_patch = rgb_canvas[120 - 8:120 + 8, 120 - 8:120 + 8]
     assert goal_patch[..., 0].max() > 150, "goal patch should contain red (R-channel)"
 
     # Current at (80, 80) * 4 = (320, 320) in canvas — should contain green
-    cur_patch = left[320 - 8:320 + 8, 320 - 8:320 + 8]
+    cur_patch = rgb_canvas[320 - 8:320 + 8, 320 - 8:320 + 8]
     assert cur_patch[..., 1].max() > 150, "current patch should contain green (G-channel)"
 
 
@@ -225,6 +249,7 @@ def test_compose_frame_draws_top_k_polylines():
     per_step_row = {
         "t": 1, "reward": -0.05, "cv_success": True,
         "cx": 70.0, "cy": 40.0, "theta_deg": 0.0,
+        "action": [0.0, 0.0, 0.0, 0.0],
     }
     goal = {"cx": 90.0, "cy": 30.0, "theta_deg": 0.0}
     # K=10 polylines from (50,50) to (90,30) area
@@ -233,8 +258,10 @@ def test_compose_frame_draws_top_k_polylines():
                                   end_cx=90.0, end_cy=30.0)
     log = _make_iter_log_with_cv(top_k_block=top_k)
 
-    composed = _compose_frame(rgb, per_step_row, goal, log, frame_idx=1)
-    left = composed[:, :CANVAS_PX]
+    composed = _compose_frame(rgb, per_step_row, goal, log, frame_idx=1,
+                              demo_stats=_make_fake_demo_stats())
+    # RGB canvas is between the side panels.
+    left = composed[:, SIDE_PANEL_W:SIDE_PANEL_W + CANVAS_PX]
 
     # Best polyline pre-blend color is bright yellow (#FFD700 = R=255, G=215, B=0).
     # After the alpha=0.6 blend with gray (40, 40, 40) background:
@@ -258,13 +285,15 @@ def test_compose_frame_handles_missing_per_sample_cv():
     per_step_row = {
         "t": 1, "reward": -0.4, "cv_success": True,
         "cx": 50.0, "cy": 50.0, "theta_deg": 10.0,
+        "action": [0.0, 0.0, 0.0, 0.0],
     }
     goal = {"cx": 64.0, "cy": 64.0, "theta_deg": 0.0}
     log = _make_iter_log_no_cv()
 
     # Should NOT raise even though sample_cx/sample_cy are None.
-    composed = _compose_frame(rgb, per_step_row, goal, log, frame_idx=1)
-    assert composed.shape == (CANVAS_PX, CANVAS_PX * 2, 3)
+    composed = _compose_frame(rgb, per_step_row, goal, log, frame_idx=1,
+                              demo_stats=_make_fake_demo_stats())
+    assert composed.shape == (COMPOSITE_H, COMPOSITE_W, 3)
 
 
 # ─── 3. compose frame 0 (no plan executed yet) renders placeholder ─────
@@ -274,21 +303,27 @@ def test_compose_frame_zero_uses_placeholder_right_half():
     per_step_row = {
         "t": 0, "reward": -1.5, "cv_success": True,
         "cx": 50.0, "cy": 60.0, "theta_deg": 30.0,
+        "action": None,
     }
     goal = {"cx": 64.0, "cy": 64.0, "theta_deg": 0.0}
 
-    composed = _compose_frame(rgb, per_step_row, goal, None, frame_idx=0)
-    assert composed.shape == (CANVAS_PX, CANVAS_PX * 2, 3)
-    # Right half should be mostly white (placeholder card)
-    right = composed[:, CANVAS_PX:]
-    assert (right > 200).mean() > 0.5, "frame-0 right half should be mostly white"
+    composed = _compose_frame(rgb, per_step_row, goal, None, frame_idx=0,
+                              demo_stats=_make_fake_demo_stats())
+    assert composed.shape == (COMPOSITE_H, COMPOSITE_W, 3)
+    # Reward plot (right plot region) lives at columns
+    # [SIDE_PANEL_W + CANVAS_PX, SIDE_PANEL_W + 2*CANVAS_PX). Should be
+    # mostly white (placeholder card).
+    plot_region = composed[:, SIDE_PANEL_W + CANVAS_PX:SIDE_PANEL_W + 2 * CANVAS_PX]
+    assert (plot_region > 200).mean() > 0.5, (
+        "frame-0 reward-plot region should be mostly white (placeholder)"
+    )
 
 
 # ─── 4. end-to-end render produces an mp4 of the right shape ───────────
 
 def test_render_combined_video_writes_mp4(tmp_path):
     run_dir = _write_minimal_run_dir(tmp_path, n_control_steps=2)
-    out = render_combined_video(run_dir, fps=8)
+    out = render_combined_video(run_dir, fps=8, demo_stats=_make_fake_demo_stats())
     assert out == run_dir / "trajectory_combined.mp4"
     assert out.exists() and out.stat().st_size > 1000
 
@@ -305,14 +340,14 @@ def test_render_combined_video_writes_mp4(tmp_path):
     assert n_frames == 3  # initial + 2 plan_steps
     assert last is not None
     H, W = last.shape[:2]
-    assert (H, W) == (CANVAS_PX, CANVAS_PX * 2)
+    assert (H, W) == (COMPOSITE_H, COMPOSITE_W)
 
 
 # ─── 5. end-to-end works with iteration_log lacking per-sample CV ──────
 
 def test_render_combined_video_works_without_per_sample_cv(tmp_path):
     run_dir = _write_minimal_run_dir(tmp_path, n_control_steps=2, include_cv=False)
-    out = render_combined_video(run_dir, fps=8)
+    out = render_combined_video(run_dir, fps=8, demo_stats=_make_fake_demo_stats())
     assert out.exists()
 
 
@@ -347,3 +382,96 @@ def test_compute_shared_y_lim_covers_full_range():
 def test_compute_shared_y_lim_empty_returns_none():
     assert _compute_shared_y_lim([]) is None
     assert _compute_shared_y_lim([[]]) is None
+
+
+# ─── 8. gripper-arrow side panels ──────────────────────────────────────
+
+def _count_pixels_close_to(img: np.ndarray, target_rgb, tol: int = 60) -> int:
+    """Count pixels whose RGB is within tol of target on every channel."""
+    diff = np.abs(img.astype(np.int16) - np.asarray(target_rgb, dtype=np.int16))
+    return int(np.sum((diff < tol).all(axis=-1)))
+
+
+def test_gripper_panel_dimensions():
+    """Panel must be exactly SIDE_PANEL_H x SIDE_PANEL_W x 3 RGB uint8."""
+    panel = _render_gripper_arrow_panel(
+        executed_action_norm=[0.0, 0.0, 0.0, 0.0],
+        gripper_label="Left",
+        color=(0, 200, 220),
+        demo_stats=_make_fake_demo_stats(),
+    )
+    assert panel.shape == (SIDE_PANEL_H, SIDE_PANEL_W, 3)
+    assert panel.dtype == np.uint8
+
+
+def test_composite_total_dimensions():
+    """The full composite must be COMPOSITE_H x COMPOSITE_W = 512 x 1280."""
+    rgb = _solid_frame()
+    per_step_row = {
+        "t": 1, "reward": -0.4, "cv_success": True,
+        "cx": 64.0, "cy": 64.0, "theta_deg": 0.0,
+        "action": [0.0, 0.0, 0.0, 0.0],
+    }
+    goal = {"cx": 64.0, "cy": 64.0, "theta_deg": 0.0}
+    composed = _compose_frame(rgb, per_step_row, goal, _make_iter_log_with_cv(),
+                              frame_idx=1, demo_stats=_make_fake_demo_stats())
+    assert composed.shape == (COMPOSITE_H, COMPOSITE_W, 3)
+    assert COMPOSITE_W == 2 * SIDE_PANEL_W + 2 * CANVAS_PX
+    assert COMPOSITE_H == CANVAS_PX
+
+
+def test_gripper_arrow_renders_when_action_nonzero():
+    """A non-zero action must leave colored arrow pixels in the panel."""
+    color = (0, 200, 220)
+    panel = _render_gripper_arrow_panel(
+        # Pick an action where dim 0 is far from the norm=0 -> raw=0.11
+        # baseline so the resulting arrow is visibly long.
+        executed_action_norm=[0.6, 0.6, 0.0, 0.0],
+        gripper_label="Left",
+        color=color,
+        demo_stats=_make_fake_demo_stats(),
+    )
+    arrow_pixels = _count_pixels_close_to(panel, color)
+    assert arrow_pixels > 30, (
+        f"expected the cyan arrow to leave pixels in the panel; got {arrow_pixels}"
+    )
+
+
+def test_gripper_arrow_scales_with_magnitude():
+    """A larger-magnitude action should produce a longer arrow (more
+    colored pixels) than a small-magnitude one."""
+    color = (0, 200, 220)
+    stats = _make_fake_demo_stats()
+    small = _render_gripper_arrow_panel(
+        executed_action_norm=[0.0, 0.0, 0.0, 0.0],  # raw = (0.11, -0.04, 0.11, -0.19)
+        gripper_label="Left", color=color, demo_stats=stats,
+    )
+    large = _render_gripper_arrow_panel(
+        executed_action_norm=[1.0, 1.0, 0.0, 0.0],  # raw = (max, max, ...)
+        gripper_label="Left", color=color, demo_stats=stats,
+    )
+    n_small = _count_pixels_close_to(small, color)
+    n_large = _count_pixels_close_to(large, color)
+    assert n_large > n_small, (
+        f"large-magnitude arrow ({n_large} px) should exceed "
+        f"small-magnitude arrow ({n_small} px)"
+    )
+
+
+def test_gripper_panel_handles_no_demo_stats_gracefully():
+    """If demo_stats is None (e.g. cache file missing), panel still renders."""
+    panel = _render_gripper_arrow_panel(
+        executed_action_norm=[0.5, 0.5, 0.5, 0.5],
+        gripper_label="Right", color=(255, 140, 0), demo_stats=None,
+    )
+    assert panel.shape == (SIDE_PANEL_H, SIDE_PANEL_W, 3)
+
+
+def test_gripper_panel_handles_no_action_at_frame_zero():
+    """Frame 0 (initial state, no plan executed yet) has executed_action_norm=None."""
+    panel = _render_gripper_arrow_panel(
+        executed_action_norm=None,
+        gripper_label="Left", color=(0, 200, 220),
+        demo_stats=_make_fake_demo_stats(),
+    )
+    assert panel.shape == (SIDE_PANEL_H, SIDE_PANEL_W, 3)

@@ -270,6 +270,15 @@ class MPPIPlanner:
         if top_k_record is not None and iteration_log:
             iteration_log[-1].update(top_k_record)
 
+        # Persist the LAST iteration's full N-sample action sequences so
+        # downstream action-distribution viz can plot the spread MPPI
+        # actually explored (not just the top-K). ~16 KB per plan_step at
+        # default N=100, H=10 -- negligible.
+        if iteration_log and last_act_seqs is not None:
+            iteration_log[-1]["last_iter_full_actions"] = (
+                last_act_seqs.detach().cpu().float().clone()
+            )
+
         n_fail = int((~last_state["success"]).sum().item()) if last_state else 0
         stats = PlanStats(
             act_seq=act_seq.detach().cpu(),
@@ -420,6 +429,9 @@ class MPPIPlanner:
             "top_k_intermediate_success": None,
             "top_k_indices": None,
             "top_k_rewards": None,
+            # Full per-sample action set from the LAST iteration. Same
+            # patching pattern as top_k_*: only set on the last iteration.
+            "last_iter_full_actions": None,
         }
 
     def _validate_config(self) -> None:

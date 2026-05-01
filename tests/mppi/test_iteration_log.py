@@ -166,7 +166,13 @@ def test_iteration_log_structure():
         "top_k_indices",
         "top_k_rewards",
     }
-    required = scalar_or_tensor_keys | optional_per_sample_keys | optional_top_k_keys
+    optional_full_action_keys = {"last_iter_full_actions"}
+    required = (
+        scalar_or_tensor_keys
+        | optional_per_sample_keys
+        | optional_top_k_keys
+        | optional_full_action_keys
+    )
     for iter_idx, rec in enumerate(log):
         assert set(rec) == required
         assert rec["iter"] == iter_idx
@@ -191,6 +197,16 @@ def test_iteration_log_structure():
             assert rec[key] is None, (
                 f"MockEnv can't provide CV; top_k field {key} should be None"
             )
+    # last_iter_full_actions is patched onto the LAST iter from the loop's
+    # cached act_seqs; earlier iters keep None.
+    for rec in log[:-1]:
+        assert rec["last_iter_full_actions"] is None
+    last = log[-1]
+    assert isinstance(last["last_iter_full_actions"], torch.Tensor)
+    assert last["last_iter_full_actions"].shape == (
+        int(cfg.n_sample), int(cfg.n_look_ahead), int(cfg.action_dim),
+    )
+    assert last["last_iter_full_actions"].device.type == "cpu"
 
 
 class CVMockEnv(MockEnv):

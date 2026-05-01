@@ -35,6 +35,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from env.pusht_wm_env import PushTWMEnv  # noqa: E402
 from rl.mppi.mppi_planner import MPPIPlanner  # noqa: E402
+from scripts.run_config import STEP_EACH_ITER, USE_WARM_START  # noqa: E402
 
 
 def _apply_cli_overrides(cfg, args) -> dict:
@@ -435,13 +436,35 @@ def main() -> None:
         "plan_wall_s": None,
     })
 
+    # Cross-step warm-start state. The converged action sequence from each
+    # plan_step is shift-and-padded into ``act_seq_running`` and fed back
+    # as ``init_act_seq`` next call (matches upstream exp_sim_control.py
+    # control loop). Initialised at zeros — the "stay-put" prior for an
+    # action space of bimanual end-effector deltas in [-1, 1]. NOT
+    # ``curr_pos.repeat(...)``: upstream uses absolute poses, we use deltas.
+    H = int(cfg.n_look_ahead)
+    A = int(cfg.action_dim)
+    act_seq_running = torch.zeros(H, A, device=env.device, dtype=torch.float32)
+
     t0_run = time.time()
     for t in range(int(cfg.control_steps)):
         t0_step = time.time()
+        init_act = act_seq_running if USE_WARM_START else None
         a, iter_log = planner.plan_step(
-            z, goal, return_iteration_log=True,
+            z, goal, init_act_seq=init_act, return_iteration_log=True,
         )                                           # (action_dim,), list[n_iter]
         z = env.dynamics_step(z, a)                 # (C, H_lat, W_lat)
+
+        if USE_WARM_START:
+            # Shift-and-pad: drop the executed prefix (STEP_EACH_ITER steps)
+            # and repeat the last action to fill the tail. The converged
+            # ``act_seq`` lives on CPU inside PlanStats; bring it onto env
+            # device so the next plan_step doesn't pay a transfer.
+            converged = planner.last_stats.act_seq.to(env.device)  # (H, A)
+            new_tail = converged[-1:].repeat(STEP_EACH_ITER, 1)
+            act_seq_running = torch.cat(
+                [converged[STEP_EACH_ITER:], new_tail], dim=0
+            )
         rgb_t = env.decode(z)
         rgb_t_u8 = (rgb_t.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8).transpose(1, 2, 0)
         state_t = env.estimate_state(rgb_t)
@@ -592,6 +615,20 @@ def main() -> None:
         print(f"  combined viz: {combined_path}")
     except Exception as exc:  # noqa: BLE001 — viz is best-effort, must not nuke a successful run
         print(f"  WARN: combined video render failed: {exc!r}")
+
+    # Per-plan-step action distribution diagnostic plots. Same best-effort
+    # convention: viz failure should not nuke a successful run.
+    try:
+        from rl.visualization.action_distribution import render_action_distributions
+        from rl.visualization.demo_action_stats import load_or_compute_demo_action_stats
+        demo_stats = load_or_compute_demo_action_stats()
+        action_dist_paths = render_action_distributions(
+            iteration_logs, per_step, out_dir, demo_stats=demo_stats,
+        )
+        print(f"  action dist plots: {len(action_dist_paths)} PNGs in "
+              f"{out_dir / 'action_dist'}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  WARN: action distribution render failed: {exc!r}")
 
     # If the run involved any config deviation, also drop a cloud-ready
     # reproduction script that uses the configured-default values.

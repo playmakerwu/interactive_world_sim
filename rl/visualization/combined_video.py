@@ -42,14 +42,26 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
+from rl.visualization.demo_action_stats import denormalize_action
+
 # ─── Layout constants ──────────────────────────────────────────────────
 
-CANVAS_PX = 512                # square canvas for both halves
+CANVAS_PX = 512                # square canvas for the RGB + reward halves
 UPSAMPLE_FROM = 128            # WM decoder native resolution
 UPSAMPLE_FACTOR = CANVAS_PX // UPSAMPLE_FROM  # 4 — must be exact integer
 
+# Side panels (for executed-action gripper arrows). Final composite is
+# 1280x512 = 128 (left arrow) + 512 (RGB) + 512 (reward plot) + 128 (right
+# arrow). Adding the panels grew the canvas from the previous 1024x512.
+SIDE_PANEL_W = 128
+SIDE_PANEL_H = CANVAS_PX
+COMPOSITE_W = SIDE_PANEL_W + CANVAS_PX + CANVAS_PX + SIDE_PANEL_W  # 1280
+COMPOSITE_H = CANVAS_PX
+
 GOAL_RGB = (220, 0, 0)         # red
 CURRENT_RGB = (0, 220, 0)      # lime green
+GRIPPER_LEFT_RGB = (0, 200, 220)    # cyan
+GRIPPER_RIGHT_RGB = (255, 140, 0)   # orange (distinct from yellow used by top-K best)
 ARROW_LEN_PX = 30              # in canvas (512) space
 MARKER_RADIUS_PX = 6
 LINE_THICKNESS = 2
@@ -273,6 +285,135 @@ def _render_iteration_plot(
     return img_rgb
 
 
+# ─── Gripper-action side panels ────────────────────────────────────────
+
+PANEL_BG = (224, 224, 224)         # light gray (#E0E0E0)
+PANEL_BORDER = (0, 0, 0)
+PANEL_TITLE_Y = 22
+PANEL_SUBTITLE_Y = 42
+PANEL_REF_LABEL_Y = SIDE_PANEL_H - 8
+PANEL_ARROW_FRACTION = 0.80         # max-magnitude arrow fills 80% of the
+                                     # panel's smaller dim
+
+
+def _render_gripper_arrow_panel(
+    executed_action_norm: list[float] | None,
+    gripper_label: str,                       # "Left" or "Right"
+    color: tuple[int, int, int],
+    demo_stats: dict | None,
+    panel_w: int = SIDE_PANEL_W,
+    panel_h: int = SIDE_PANEL_H,
+) -> np.ndarray:
+    """Render one (panel_h x panel_w x 3) RGB side panel showing the
+    executed action for one gripper as a 2-D arrow from panel center,
+    plus a reference circle at the demo std-magnitude scale.
+
+    ``executed_action_norm`` is the 4-D normalized action; we pull dims
+    [0,1] for left, [2,3] for right and denormalize via demo_stats's
+    ``normalizer``. ``demo_stats`` is the cached payload from
+    ``rl.visualization.demo_action_stats``.
+
+    If ``executed_action_norm`` is None (e.g. frame 0, before any plan
+    step), the panel is rendered with arrow magnitude zero (just origin
+    dot + reference circle + "no plan yet" subtitle).
+
+    If ``demo_stats`` is None, we degrade gracefully: panel drawn with
+    color stripe + label, no arrow.
+    """
+    panel = np.full((panel_h, panel_w, 3), PANEL_BG, dtype=np.uint8)
+    cv2.rectangle(panel, (0, 0), (panel_w - 1, panel_h - 1), PANEL_BORDER, 1)
+
+    title = f"{gripper_label} gripper action"
+    _draw_text_with_outline(
+        panel, title, (6, PANEL_TITLE_Y),
+        color=(20, 20, 20), scale=0.45, thickness=1,
+    )
+
+    if demo_stats is None:
+        _draw_text_with_outline(
+            panel, "(demo stats missing)", (6, PANEL_SUBTITLE_Y),
+            color=(120, 0, 0), scale=0.40, thickness=1,
+        )
+        return panel
+
+    # Determine which dims belong to this gripper.
+    gripper_label_lc = gripper_label.lower()
+    if gripper_label_lc.startswith("left"):
+        dim_a, dim_b = 0, 1
+        max_mag = float(demo_stats.get("max_magnitude_left", 0.4))
+        std_mag = float(demo_stats.get("std_magnitude_left", 0.15))
+    else:
+        dim_a, dim_b = 2, 3
+        max_mag = float(demo_stats.get("max_magnitude_right", 0.5))
+        std_mag = float(demo_stats.get("std_magnitude_right", 0.12))
+
+    # Denormalize -> raw physical units (meters)
+    raw_a = raw_b = 0.0
+    if executed_action_norm is not None:
+        normalizer = demo_stats["normalizer"]
+        a_t = torch.tensor(executed_action_norm, dtype=torch.float32)
+        raw = denormalize_action(a_t, normalizer).tolist()
+        raw_a, raw_b = float(raw[dim_a]), float(raw[dim_b])
+
+    mag_raw = math.hypot(raw_a, raw_b)
+
+    # Subtitle: per-component values in raw meters
+    if executed_action_norm is None:
+        subtitle = "(no plan yet)"
+    else:
+        subtitle = f"x={raw_a:+.3f} m  y={raw_b:+.3f} m"
+    _draw_text_with_outline(
+        panel, subtitle, (6, PANEL_SUBTITLE_Y),
+        color=(40, 40, 40), scale=0.36, thickness=1,
+    )
+    if executed_action_norm is not None:
+        mag_line = f"|a| = {mag_raw:.3f} m"
+        _draw_text_with_outline(
+            panel, mag_line, (6, PANEL_SUBTITLE_Y + 16),
+            color=(40, 40, 40), scale=0.36, thickness=1,
+        )
+
+    # Geometry. Origin = panel center.
+    origin = (panel_w // 2, panel_h // 2)
+
+    # Pixel scale: max demo magnitude -> 80% of panel's smaller dim.
+    smaller_dim = min(panel_w, panel_h)
+    px_per_m = (smaller_dim * PANEL_ARROW_FRACTION / 2.0) / max(max_mag, 1e-6)
+
+    # Demo-std reference circle (gray dashed-feel — drawn as a thin solid
+    # ring; cv2 has no native dashed circle).
+    std_radius_px = int(round(std_mag * px_per_m))
+    if std_radius_px > 0:
+        cv2.circle(panel, origin, std_radius_px, (140, 140, 140),
+                   thickness=1, lineType=cv2.LINE_AA)
+        _draw_text_with_outline(
+            panel, "demo std", (origin[0] - std_radius_px - 28,
+                                 origin[1] + std_radius_px + 12),
+            color=(100, 100, 100), scale=0.32, thickness=1,
+        )
+
+    # Origin dot
+    cv2.circle(panel, origin, 3, (60, 60, 60), thickness=-1)
+
+    # Arrow: y-up convention (negate raw_b for screen y)
+    if executed_action_norm is not None and mag_raw > 1e-6:
+        tip_x = int(round(origin[0] + raw_a * px_per_m))
+        tip_y = int(round(origin[1] - raw_b * px_per_m))
+        # White halo for legibility
+        cv2.arrowedLine(panel, origin, (tip_x, tip_y), (255, 255, 255),
+                        thickness=4, tipLength=0.25, line_type=cv2.LINE_AA)
+        cv2.arrowedLine(panel, origin, (tip_x, tip_y), color,
+                        thickness=2, tipLength=0.25, line_type=cv2.LINE_AA)
+
+    # Bottom-right reference label about scale: show what 80% of panel = max_mag in m
+    ref_text = f"max demo |a|={max_mag:.3f}"
+    _draw_text_with_outline(
+        panel, ref_text, (6, PANEL_REF_LABEL_Y),
+        color=(80, 80, 80), scale=0.32, thickness=1,
+    )
+    return panel
+
+
 # ─── Per-frame composite ───────────────────────────────────────────────
 
 def _compose_frame(
@@ -283,6 +424,7 @@ def _compose_frame(
     frame_idx: int,
     upsample_factor: int = UPSAMPLE_FACTOR,
     y_lim: tuple[float, float] | None = None,
+    demo_stats: dict | None = None,
 ) -> np.ndarray:
     """Build one combined frame (1024x512 RGB uint8).
 
@@ -381,8 +523,17 @@ def _compose_frame(
     right = _render_iteration_plot(step_log, final_reward, dist, canvas_px,
                                    y_lim=y_lim)
 
-    # Stitch horizontally
-    combined = np.concatenate([left, right], axis=1)
+    # Side panels: executed-action gripper arrows.
+    executed_action_norm = per_step_row.get("action")  # list[float] | None
+    left_panel = _render_gripper_arrow_panel(
+        executed_action_norm, "Left", GRIPPER_LEFT_RGB, demo_stats,
+    )
+    right_panel = _render_gripper_arrow_panel(
+        executed_action_norm, "Right", GRIPPER_RIGHT_RGB, demo_stats,
+    )
+
+    # Stitch horizontally: left_panel | RGB | reward_plot | right_panel
+    combined = np.concatenate([left_panel, left, right, right_panel], axis=1)
     return combined
 
 
@@ -432,6 +583,7 @@ def render_combined_video(
     run_dir: Path,
     fps: int = 8,
     upsample_factor: int = UPSAMPLE_FACTOR,
+    demo_stats: dict | None = None,
 ) -> Path:
     """Read run_dir's existing artifacts and write trajectory_combined.mp4.
 
@@ -489,9 +641,21 @@ def render_combined_video(
     n = min(n_frames, n_per_step)
 
     canvas_px = frames_rgb[0].shape[0] * upsample_factor
-    out_h, out_w = canvas_px, canvas_px * 2
+    # Composite is left_panel + RGB + reward_plot + right_panel = 1280x512
+    out_h, out_w = canvas_px, SIDE_PANEL_W + canvas_px + canvas_px + SIDE_PANEL_W
     fourcc = cv2.VideoWriter.fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(out_mp4), fourcc, fps, (out_w, out_h))
+
+    # Lazy-load demo stats once for the side panels (cheap; cached on disk).
+    if demo_stats is None:
+        try:
+            from rl.visualization.demo_action_stats import (
+                load_or_compute_demo_action_stats,
+            )
+            demo_stats = load_or_compute_demo_action_stats()
+        except Exception:  # noqa: BLE001
+            demo_stats = None
+
     try:
         for i in range(n):
             # iteration_logs[k] corresponds to per_step[k+1] (k-th plan_step
@@ -502,7 +666,7 @@ def render_combined_video(
             combined_rgb = _compose_frame(
                 frames_rgb[i], per_step[i], goal, step_log,
                 frame_idx=i, upsample_factor=upsample_factor,
-                y_lim=y_lim,
+                y_lim=y_lim, demo_stats=demo_stats,
             )
             writer.write(cv2.cvtColor(combined_rgb, cv2.COLOR_RGB2BGR))
     finally:
