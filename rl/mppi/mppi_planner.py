@@ -37,6 +37,7 @@ import torch.nn.functional as F
 from omegaconf import DictConfig
 
 from env.pusht_wm_env import PushTWMEnv
+from rl.mppi import distributed as D
 
 
 @dataclass
@@ -203,6 +204,33 @@ class MPPIPlanner:
                 out[key] = combined
         return out
 
+    def _gather_state_dict(self, state_local: dict[str, Any]) -> dict[str, Any]:
+        """All-gather a per-sample CV state dict across ranks.
+
+        ``estimate_state`` returns CPU tensors of shape ``(K,)`` with float32
+        keys (cx, cy, sin_theta, cos_theta, theta_deg, contour_area,
+        icp_residual) and a bool key (success). NCCL only supports a fixed
+        set of dtypes, so we promote on the way in (bool → uint8) and demote
+        on the way out. The final dict matches the single-process schema
+        exactly: same keys, same dtypes, same device (CPU), shape (N,).
+        """
+        out: dict[str, Any] = {}
+        for key, val in state_local.items():
+            if not isinstance(val, torch.Tensor):
+                # Mock envs may return lists; fall back to plain concatenation
+                # via maybe_barrier / gather_object would add complexity for
+                # no production benefit, so we just keep the local slice.
+                out[key] = val
+                continue
+            if val.dtype == torch.bool:
+                gpu = val.to(self.device, dtype=torch.uint8).contiguous()
+                gathered = D.all_gather_concat(gpu).to(torch.bool).cpu()
+            else:
+                gpu = val.to(self.device, dtype=torch.float32).contiguous()
+                gathered = D.all_gather_concat(gpu).cpu()
+            out[key] = gathered
+        return out
+
     def trajectory_optimization(
         self,
         z_current: torch.Tensor,
@@ -236,6 +264,20 @@ class MPPIPlanner:
             assert z_current.shape[0] == 1
             z_current = z_current[0]
 
+        # ── multi-GPU sample-shard setup ─────────────────────────────
+        # Single-process path (D.is_dist() is False): rank=0, world=1, no
+        # broadcasts/gathers happen — see rl/mppi/distributed.py for the
+        # short-circuit semantics. The conditionals below take the
+        # else-branches and the math is byte-identical to the pre-fix code.
+        N = int(self.cfg.n_sample)
+        world = D.world_size()
+        r = D.rank()
+        if world > 1:
+            assert N % world == 0, (
+                f"n_sample={N} must be divisible by world_size={world}"
+            )
+        K = N // world  # per-rank slice size
+
         iter_best_rewards: list[float] = []
         iteration_log: list[dict[str, Any]] = []
         last_rewards: torch.Tensor | None = None
@@ -245,39 +287,74 @@ class MPPIPlanner:
         last_rewards_full: torch.Tensor | None = None  # GPU copy for re-roll
 
         for iter_idx in range(int(self.cfg.n_update_iter)):
-            act_seqs = self.sample_action_sequences(act_seq)         # (N, H, A)
-            rewards, state = self.evaluate_trajectories(z_current, act_seqs, goal_state)
+            # ── 1. Sample (rank 0 only) + broadcast ──────────────────
+            # Numerical-equivalence guarantee with single-GPU runs at the
+            # same seed: only rank 0 advances self._gen, then broadcasts.
+            if r == 0:
+                act_seqs = self.sample_action_sequences(act_seq)     # (N, H, A)
+            else:
+                act_seqs = torch.empty(
+                    (N, H, A), dtype=torch.float32, device=self.device,
+                )
+            D.broadcast_(act_seqs, src=0)
+
+            # ── 2. Evaluate local slice ──────────────────────────────
+            local_act = act_seqs[r * K : (r + 1) * K] if world > 1 else act_seqs
+            rewards_local, state_local = self.evaluate_trajectories(
+                z_current, local_act, goal_state,
+            )
+
+            # ── 3. Gather rewards + state ───────────────────────────
+            if D.is_dist():
+                # rewards_local arrives on CPU from env.compute_reward; move
+                # to GPU for NCCL all_gather, then back to CPU to match the
+                # single-GPU semantics expected downstream.
+                rewards_gpu = rewards_local.to(self.device).contiguous()
+                rewards = D.all_gather_concat(rewards_gpu).cpu()
+                state = self._gather_state_dict(state_local)
+            else:
+                rewards = rewards_local
+                state = state_local
+
+            # ── 4. Optimize (deterministic on every rank) ───────────
+            # Mathematically equivalent to "rank-0 optimize + broadcast"
+            # but without the extra collective: every rank holds the full
+            # rewards tensor (from all_gather) and runs the same softmax
+            # + weighted-mean, producing bit-identical act_seq.
             act_seq, weights = self.optimize_action_mppi(act_seqs, rewards)
+
             iter_best_rewards.append(float(rewards.max()))
             last_rewards = rewards.detach().cpu()
             last_weights = weights.detach().cpu()
             last_state = state
             last_act_seqs = act_seqs
             last_rewards_full = rewards
-            iteration_log.append(
-                self._build_iteration_record(iter_idx, rewards, weights, state=state)
-            )
+            if r == 0:
+                iteration_log.append(
+                    self._build_iteration_record(iter_idx, rewards, weights, state=state)
+                )
 
         # After the optimization loop, re-roll the top-K trajectories from
         # the last iteration and CV-label every step along the rollout, so
         # downstream visualization can draw full predicted polylines (not
-        # just endpoints). Cheap: K << N. None when env can't provide CV
-        # (mock envs in unit tests).
-        top_k_record = self._compute_top_k_intermediate_cv(
-            z_current, last_act_seqs, last_rewards_full,
-            k=int(getattr(self.cfg, "top_k_polylines", 10)),
-        )
-        if top_k_record is not None and iteration_log:
-            iteration_log[-1].update(top_k_record)
-
-        # Persist the LAST iteration's full N-sample action sequences so
-        # downstream action-distribution viz can plot the spread MPPI
-        # actually explored (not just the top-K). ~16 KB per plan_step at
-        # default N=100, H=10 -- negligible.
-        if iteration_log and last_act_seqs is not None:
-            iteration_log[-1]["last_iter_full_actions"] = (
-                last_act_seqs.detach().cpu().float().clone()
+        # just endpoints). Stays on rank 0 in multi-GPU mode (per the
+        # design: top-K viz is not worth gathering for shared work).
+        if r == 0:
+            top_k_record = self._compute_top_k_intermediate_cv(
+                z_current, last_act_seqs, last_rewards_full,
+                k=int(getattr(self.cfg, "top_k_polylines", 10)),
             )
+            if top_k_record is not None and iteration_log:
+                iteration_log[-1].update(top_k_record)
+
+            # Persist the LAST iteration's full N-sample action sequences so
+            # downstream action-distribution viz can plot the spread MPPI
+            # actually explored (not just the top-K). ~16 KB per plan_step at
+            # default N=100, H=10 -- negligible.
+            if iteration_log and last_act_seqs is not None:
+                iteration_log[-1]["last_iter_full_actions"] = (
+                    last_act_seqs.detach().cpu().float().clone()
+                )
 
         n_fail = int((~last_state["success"]).sum().item()) if last_state else 0
         stats = PlanStats(
