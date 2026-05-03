@@ -58,6 +58,11 @@ def _apply_cli_overrides(cfg, args) -> dict:
         cfg.seed = int(args.seed)
     if getattr(args, "decode_batch_size", None) is not None:
         cfg.decode_batch_size = int(args.decode_batch_size)
+    if getattr(args, "cv_n_workers", None) is not None:
+        # Infra/perf knob — does not change the CV pipeline numerically
+        # (label_batch is bit-exact at any worker count). Mutate cfg
+        # silently, no override_reason required.
+        cfg.cv_n_workers = int(args.cv_n_workers)
 
     if getattr(args, "n_sample", None) is not None and int(args.n_sample) != int(cfg.n_sample):
         config_deviation["changed"].append(
@@ -366,6 +371,16 @@ def main() -> None:
              "changing N, horizon, or the sampled action set.",
     )
     ap.add_argument(
+        "--cv_n_workers", type=int, default=None,
+        help="Number of CPU worker processes for the batched CV labeler. "
+             "0 = sequential (default; bit-exact with the historical loop). "
+             ">0 = spawn-pool of this many workers per estimate_state call. "
+             "Infra/perf knob, NOT an algorithm change — no --override_reason "
+             "required. Pays off only for n_sample sufficiently large that "
+             "the CV time amortizes the spawn overhead; see the cv-batching "
+             "N-sweep report for the threshold.",
+    )
+    ap.add_argument(
         "--horizon", type=int, default=None,
         help="Override config.n_look_ahead (planning horizon H). Range "
              "[1, 50]; the IWS WM's internal sliding 10-frame attention "
@@ -397,7 +412,11 @@ def main() -> None:
     print(f"Effective config:\n{OmegaConf.to_yaml(cfg)}")
 
     print(f"Loading WM from {args.wm_ckpt}")
-    env = PushTWMEnv(args.wm_ckpt, device="cuda:0")
+    env = PushTWMEnv(
+        args.wm_ckpt,
+        device="cuda:0",
+        cv_n_workers=int(getattr(cfg, "cv_n_workers", 0) or 0),
+    )
 
     print(f"Encoding initial state from {args.initial_hdf5} frame {args.initial_frame}")
     z = env.load_initial_from_hdf5(args.initial_hdf5, frame_idx=args.initial_frame)

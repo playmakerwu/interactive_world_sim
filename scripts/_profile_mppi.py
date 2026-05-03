@@ -9,15 +9,23 @@ Two modes:
     prints the historical stage breakdown.
   * ``--n_sweep N1,N2,...`` — runs ONE plan_step at each requested
     ``n_sample``, splits decoder time into in-loop vs post-loop top-K
-    viz, writes a CSV under outputs/profiling/ and a per-sample-µs
-    markdown table to stdout.
+    viz, writes timing AND memory CSVs under outputs/profiling/ plus
+    matching markdown tables to stdout.
+
+CPU peak sampling caveat: the n_sweep memory table samples parent +
+worker RSS at end-of-step via ``psutil.Process().children(recursive=True)``.
+If pool workers spawn AND die within the same step (which the current
+recreate-per-call CVLabeler.label_batch policy can do), their peak RSS
+may be missed entirely. Treat ``cpu_total_peak_mb`` as a lower bound,
+not a guaranteed peak. A continuous sampling thread would fix this and
+is out of scope for this round.
 
 Run:
     PYTHONUNBUFFERED=1 python -u scripts/_profile_mppi.py \
         > /tmp/mppi_profile.log 2>&1
 
     PYTHONUNBUFFERED=1 python -u scripts/_profile_mppi.py \
-        --n_sweep 1,2,4,8 \
+        --n_sweep 1,2,4,8 --cv_n_workers 4 \
         2>&1 | tee outputs/profiling/n_sweep_$(date +%Y%m%d_%H%M%S).log
 """
 
@@ -35,6 +43,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import psutil
 import torch
 from omegaconf import OmegaConf
 
@@ -241,23 +250,51 @@ def _aggregate_for_stage(keys: list[str]) -> tuple[float, int]:
     return total, calls
 
 
+def _sample_cpu_total_rss_mb() -> float:
+    """Sum RSS of the parent process and all live descendants, in MiB.
+
+    Sampled once per call. See module docstring for the caveat about
+    short-lived workers whose peak may be missed.
+    """
+    proc = psutil.Process()
+    total = proc.memory_info().rss
+    for child in proc.children(recursive=True):
+        try:
+            total += child.memory_info().rss
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            # Worker died between enumeration and stat — fine, just skip.
+            continue
+    return total / (1024 ** 2)
+
+
 def run_n_sweep(
     n_values: list[int],
     seed: int,
     decode_batch_size: int,
+    cv_n_workers: int,
     output_csv: Path,
-) -> dict[int, dict[str, tuple[float, int]]]:
+    output_mem_csv: Path,
+) -> tuple[
+    dict[int, dict[str, tuple[float, int]]],
+    dict[int, dict[str, float]],
+]:
     """For each N, build a fresh planner, run ONE plan_step, snapshot
-    stage stats. Catches OOM so subsequent N values still run.
+    stage stats AND memory metrics. Catches OOM so subsequent N values
+    still run.
 
-    Returns {n: {stage_label: (total_s, calls)}}.
+    Returns (timing_results, memory_results) where:
+      timing_results = {n: {stage_label: (total_s, calls)}}
+      memory_results = {n: {"gpu_peak_mb", "gpu_reserved_mb",
+                            "cpu_total_peak_mb", "plan_step_total_s"}}
     """
     results: dict[int, dict[str, tuple[float, int]]] = {}
+    mem_results: dict[int, dict[str, float]] = {}
 
-    print("Loading WM…")
+    print(f"Loading WM (cv_n_workers={cv_n_workers})…")
     env = PushTWMEnv(
         str(REPO_ROOT / "outputs/pusht_cam1/checkpoints/best.ckpt"),
         device="cuda:0",
+        cv_n_workers=cv_n_workers,
     )
     patch_env(env)
 
@@ -282,6 +319,8 @@ def run_n_sweep(
             torch.cuda.manual_seed_all(seed)
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
+
+        cpu_pre_mb = _sample_cpu_total_rss_mb()
 
         planner = MPPIPlanner(env, cfg)
         patch_planner(planner)
@@ -308,11 +347,32 @@ def run_n_sweep(
                 per_stage[label] = (math.nan, 0)
         results[n] = per_stage
 
-        if torch.cuda.is_available():
-            peak_mb = torch.cuda.max_memory_allocated() / (1024**2)
-            print(f"  Peak CUDA: {peak_mb:.1f} MiB")
+        # ── memory snapshot (sampled at end of step) ─────────────────
+        if torch.cuda.is_available() and ok:
+            gpu_peak_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+            gpu_reserved_mb = torch.cuda.max_memory_reserved() / (1024 ** 2)
+        else:
+            gpu_peak_mb = math.nan
+            gpu_reserved_mb = math.nan
+        cpu_post_mb = _sample_cpu_total_rss_mb() if ok else math.nan
+        plan_step_total_s = (
+            float(np.sum(ACC.get("plan_step (caller side)", [])))
+            if ok else math.nan
+        )
+        mem_results[n] = {
+            "gpu_peak_mb": gpu_peak_mb,
+            "gpu_reserved_mb": gpu_reserved_mb,
+            "cpu_total_peak_mb": cpu_post_mb,
+            "cpu_pre_mb": cpu_pre_mb,
+            "plan_step_total_s": plan_step_total_s,
+        }
+        print(
+            f"  Peak CUDA alloc/reserved: "
+            f"{gpu_peak_mb:.1f} / {gpu_reserved_mb:.1f} MiB | "
+            f"CPU RSS pre→post: {cpu_pre_mb:.1f} → {cpu_post_mb:.1f} MiB"
+        )
 
-    # ── CSV ────────────────────────────────────────────────────────────
+    # ── timing CSV ─────────────────────────────────────────────────────
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     with output_csv.open("w", newline="") as f:
         w = csv.writer(f)
@@ -326,9 +386,28 @@ def run_n_sweep(
                     else math.nan
                 )
                 w.writerow([n, label, f"{total_s:.6f}", f"{per_sample_us:.2f}", calls])
-    print(f"\nCSV → {output_csv}")
+    print(f"\nTiming CSV  → {output_csv}")
 
-    # ── markdown table ─────────────────────────────────────────────────
+    # ── memory CSV ─────────────────────────────────────────────────────
+    output_mem_csv.parent.mkdir(parents=True, exist_ok=True)
+    with output_mem_csv.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "n_sample", "gpu_peak_mb", "gpu_reserved_mb",
+            "cpu_total_peak_mb", "plan_step_total_s",
+        ])
+        for n in n_values:
+            m = mem_results[n]
+            w.writerow([
+                n,
+                f"{m['gpu_peak_mb']:.1f}",
+                f"{m['gpu_reserved_mb']:.1f}",
+                f"{m['cpu_total_peak_mb']:.1f}",
+                f"{m['plan_step_total_s']:.6f}",
+            ])
+    print(f"Memory CSV  → {output_mem_csv}")
+
+    # ── timing markdown table ─────────────────────────────────────────
     print("\n## Per-sample microseconds (total stage time / N) by stage and N\n")
     header = "| Stage | " + " | ".join(f"N={n}" for n in n_values) + " |"
     sep = "|" + "|".join(["---"] * (len(n_values) + 1)) + "|"
@@ -344,7 +423,21 @@ def run_n_sweep(
                 cells.append("    NaN  ")
         print(f"| {label} | " + " | ".join(cells) + " |")
     print()
-    return results
+
+    # ── memory markdown table ─────────────────────────────────────────
+    print("## Peak memory by N (sampled at end of plan_step)\n")
+    print("| n_sample | gpu_peak_mb | gpu_reserved_mb | cpu_total_peak_mb | plan_step_total_s |")
+    print("|---|---|---|---|---|")
+    for n in n_values:
+        m = mem_results[n]
+        print(
+            f"| {n} | {m['gpu_peak_mb']:>8.1f} | "
+            f"{m['gpu_reserved_mb']:>8.1f} | "
+            f"{m['cpu_total_peak_mb']:>8.1f} | "
+            f"{m['plan_step_total_s']:>8.3f} |"
+        )
+    print()
+    return results, mem_results
 
 
 # ── main ───────────────────────────────────────────────────────────────
@@ -377,21 +470,30 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--decode_batch_size", type=int, default=8)
     ap.add_argument(
+        "--cv_n_workers", type=int, default=0,
+        help="CV labeler worker count plumbed into PushTWMEnv. 0 = sequential. "
+             "Profiler-side knob only — does not change algorithmic output.",
+    )
+    ap.add_argument(
         "--csv_dir", type=str, default="outputs/profiling",
-        help="Directory for the n_sweep CSV.",
+        help="Directory for the n_sweep CSVs (timing + memory).",
     )
     args = ap.parse_args()
 
     if args.n_sweep is not None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         csv_path = REPO_ROOT / args.csv_dir / f"n_sweep_{ts}.csv"
+        mem_csv_path = REPO_ROOT / args.csv_dir / f"n_sweep_memory_{ts}.csv"
         print(f"n_sweep mode: N={args.n_sweep}, seed={args.seed}, "
-              f"decode_batch_size={args.decode_batch_size}")
+              f"decode_batch_size={args.decode_batch_size}, "
+              f"cv_n_workers={args.cv_n_workers}")
         run_n_sweep(
             args.n_sweep,
             seed=args.seed,
             decode_batch_size=args.decode_batch_size,
+            cv_n_workers=args.cv_n_workers,
             output_csv=csv_path,
+            output_mem_csv=mem_csv_path,
         )
         return
 
@@ -409,10 +511,11 @@ def main() -> None:
           f"n_look_ahead={cfg.n_look_ahead}, control_steps={cfg.control_steps}, "
           f"decode_batch_size={cfg.decode_batch_size}")
 
-    print("Loading WM…")
+    print(f"Loading WM (cv_n_workers={args.cv_n_workers})…")
     env = PushTWMEnv(
         str(REPO_ROOT / "outputs/pusht_cam1/checkpoints/best.ckpt"),
         device="cuda:0",
+        cv_n_workers=args.cv_n_workers,
     )
     z = env.load_initial_from_hdf5(
         REPO_ROOT / "data/mini/pusht/val/episode_0.hdf5", frame_idx=0,

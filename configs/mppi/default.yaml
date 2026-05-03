@@ -33,3 +33,12 @@ action_upper_lim: [1.0, 1.0, 1.0, 1.0]
 control_steps: 50         # plan_step calls per episode
 seed: 0                   # planner sampler RNG seed (does not control WM
                           # denoiser noise — that uses the global CUDA RNG)
+
+# --- CV labeler infra (perf knob, not algorithmic) ---
+cv_n_workers: 0           # 0 = sequential CV loop (default; bit-exact with
+                          # the historical per-image path).
+                          # >0 = spawn-pool with this many workers for the
+                          # batched CV path. Recommended only for n_sample
+                          # >= 16 due to spawn-per-call overhead; see the
+                          # cv-batching N-sweep report for the threshold
+                          # at which workers pay off vs sequential.
