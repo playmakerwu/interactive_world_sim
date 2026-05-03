@@ -18,7 +18,8 @@ License: MIT (per supervisor repo's pyproject.toml)
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+import multiprocessing
+from dataclasses import asdict, dataclass
 from typing import Literal
 
 import cv2
@@ -291,6 +292,30 @@ FAIL_RESULT_TEMPLATE = CVLabelResult(
 )
 
 
+# ── Worker-pool plumbing for label_batch ─────────────────────────────
+#
+# The CV pipeline is CPU-bound (HSV mask → contour → trimmed-ICP per
+# 30-degree start angle), so threading does not help past the GIL.
+# Multiprocessing does, but we MUST use the spawn context: the parent
+# process holds CUDA state (the WM lives on GPU), and forking with live
+# CUDA contexts corrupts both parent and child. The two functions below
+# are module-level so they're picklable through spawn; the labeler is
+# reconstructed inside each worker rather than pickled, which avoids
+# pickling cv2 / kdtree state and makes worker init order-independent.
+
+_WORKER_LABELER: "CVLabeler | None" = None
+
+
+def _worker_init(preset: "PresetName", resolution: int) -> None:
+    global _WORKER_LABELER
+    _WORKER_LABELER = CVLabeler(preset=preset, resolution=resolution)
+
+
+def _worker_label(image: np.ndarray) -> dict:
+    assert _WORKER_LABELER is not None, "_worker_init was not called"
+    return _WORKER_LABELER.label(image).as_dict()
+
+
 class CVLabeler:
     """Reusable CV labeler bound to a preset + canvas resolution.
 
@@ -382,6 +407,41 @@ class CVLabeler:
         if return_masks:
             return result, raw_mask, post_morph
         return result
+
+    def label_batch(
+        self,
+        images: list[np.ndarray],
+        n_workers: int = 0,
+    ) -> list[dict]:
+        """Label a batch of RGB images, returning ordered ``CVLabelResult.as_dict()``.
+
+        Args:
+            images: list of (H, W, 3) RGB arrays matching ``self.resolution``.
+            n_workers: 0 → sequential loop in this process (no pool overhead;
+                this is the default, drop-in equivalent to the per-image
+                ``label`` loop callers used to write).
+                ≥1 → spawn ``n_workers`` processes via the ``spawn`` context.
+
+        Output order is guaranteed to match input order (we use ``pool.map``,
+        not ``imap_unordered``). Per-image semantics are bit-exact with
+        ``self.label(img).as_dict()`` — no preset, ICP-tolerance, or
+        morphology-kernel knob is touched in this method.
+
+        TODO(perf): pool reuse across plan_step calls. Right now we
+        recreate the pool every call, which costs one spawn-per-worker
+        per call (~tens of ms per worker on Linux). Acceptable while we
+        validate correctness; revisit if the profiler shows pool-init
+        as the dominant CV cost at small N.
+        """
+        if n_workers <= 0:
+            return [self.label(img).as_dict() for img in images]
+        ctx = multiprocessing.get_context("spawn")
+        with ctx.Pool(
+            processes=int(n_workers),
+            initializer=_worker_init,
+            initargs=(self.preset, self.resolution),
+        ) as pool:
+            return pool.map(_worker_label, images)
 
 
 def label_image(
