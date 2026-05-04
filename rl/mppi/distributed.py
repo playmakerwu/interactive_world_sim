@@ -76,7 +76,7 @@ def init_dist(
     backend: str = "nccl",
     master_addr: str = "127.0.0.1",
     master_port: int = 29500,
-    timeout_seconds: int = 30,
+    timeout_seconds: int = 24 * 3600,
 ) -> None:
     """Initialize ``torch.distributed`` and pin the current CUDA device.
 
@@ -86,6 +86,12 @@ def init_dist(
     """
     os.environ.setdefault("MASTER_ADDR", master_addr)
     os.environ.setdefault("MASTER_PORT", str(master_port))
+    # 24h NCCL collective timeout: tolerate transient rank speed asymmetry
+    # such as CV pool spawn jitter or brief memory pressure. This does NOT
+    # fix persistent contention from multi-tenant GPU sharing — for that,
+    # use CUDA_VISIBLE_DEVICES to ensure exclusive GPU access. If a rank is
+    # consistently slower (e.g., another user's process on the same GPU),
+    # this timeout just delays the eventual abort while wall time balloons.
     dist.init_process_group(
         backend=backend,
         rank=rank_,
