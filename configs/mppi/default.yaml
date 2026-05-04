@@ -33,3 +33,6 @@ action_upper_lim: [1.0, 1.0, 1.0, 1.0]
 control_steps: 50         # plan_step calls per episode
 seed: 0                   # planner sampler RNG seed (does not control WM
                           # denoiser noise — that uses the global CUDA RNG)
+
+# --- CV labeler infra (perf knob, not algorithmic) ---
+cv_n_workers: 16          # 16-worker persistent pool, optimal for N=100 production batches (10x faster than sequential, ~9.5 GB worker RSS). For smaller N (8) cv8 is marginally faster but cv16 still 4.6x over sequential. Set to 0 to disable on small-RAM hosts.

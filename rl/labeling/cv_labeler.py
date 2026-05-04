@@ -18,7 +18,10 @@ License: MIT (per supervisor repo's pyproject.toml)
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+import multiprocessing
+import multiprocessing.pool
+import sys
+from dataclasses import asdict, dataclass
 from typing import Literal
 
 import cv2
@@ -291,12 +294,41 @@ FAIL_RESULT_TEMPLATE = CVLabelResult(
 )
 
 
+# ── Worker-pool plumbing for label_batch ─────────────────────────────
+#
+# The CV pipeline is CPU-bound (HSV mask → contour → trimmed-ICP per
+# 30-degree start angle), so threading does not help past the GIL.
+# Multiprocessing does, but we MUST use the spawn context: the parent
+# process holds CUDA state (the WM lives on GPU), and forking with live
+# CUDA contexts corrupts both parent and child. The two functions below
+# are module-level so they're picklable through spawn; the labeler is
+# reconstructed inside each worker rather than pickled, which avoids
+# pickling cv2 / kdtree state and makes worker init order-independent.
+
+_WORKER_LABELER: "CVLabeler | None" = None
+
+
+def _worker_init(preset: "PresetName", resolution: int) -> None:
+    global _WORKER_LABELER
+    _WORKER_LABELER = CVLabeler(preset=preset, resolution=resolution)
+
+
+def _worker_label(image: np.ndarray) -> dict:
+    assert _WORKER_LABELER is not None, "_worker_init was not called"
+    return _WORKER_LABELER.label(image).as_dict()
+
+
 class CVLabeler:
     """Reusable CV labeler bound to a preset + canvas resolution.
 
     The template contour depends on the resolution (scale = res / 512), so
     we pre-compute it at construction time to avoid repeating the work
     for every frame in a bulk label run.
+
+    Note: callers should explicitly call ``labeler.close()`` at end of use
+    (typically end of episode in PushTWMEnv lifecycle). ``__del__`` is a
+    defensive fallback only — multiprocessing teardown during interpreter
+    shutdown can fail silently and leave zombie worker processes.
     """
 
     def __init__(self, preset: PresetName = "REAL", resolution: int = 128):
@@ -309,6 +341,9 @@ class CVLabeler:
         self.hsv_lower, self.hsv_upper = HSV_PRESETS[preset]
         self._t_scale = resolution / 512.0
         self._template_contour = _get_template_contour(T_BLOCK_SHAPE, self._t_scale)
+        # Pool reuse state — lazily populated on first label_batch(n_workers > 0).
+        self._persistent_pool: multiprocessing.pool.Pool | None = None
+        self._pool_n_workers: int | None = None
 
     def label(
         self,
@@ -382,6 +417,88 @@ class CVLabeler:
         if return_masks:
             return result, raw_mask, post_morph
         return result
+
+    def _get_or_create_pool(self, n_workers: int) -> multiprocessing.pool.Pool:
+        """Return a cached spawn-context worker pool of size ``n_workers``,
+        recreating if the cached pool's worker count differs.
+
+        Pool recreation prints a one-line warning to stderr so the ~spawn-cost
+        spike is attributable in profiling output rather than appearing as a
+        mysterious latency bump.
+        """
+        if (
+            self._persistent_pool is not None
+            and self._pool_n_workers == n_workers
+        ):
+            return self._persistent_pool
+        if self._persistent_pool is not None:
+            print(
+                f"CVLabeler: pool recreating "
+                f"(n_workers {self._pool_n_workers} -> {n_workers})",
+                file=sys.stderr,
+            )
+            try:
+                self._persistent_pool.close()
+                self._persistent_pool.join()
+            except Exception:
+                pass
+        ctx = multiprocessing.get_context("spawn")
+        self._persistent_pool = ctx.Pool(
+            processes=int(n_workers),
+            initializer=_worker_init,
+            initargs=(self.preset, self.resolution),
+        )
+        self._pool_n_workers = int(n_workers)
+        return self._persistent_pool
+
+    def close(self) -> None:
+        """Tear down the persistent worker pool. Idempotent. Callers should
+        invoke this at end of use (e.g. end of episode in PushTWMEnv);
+        ``__del__`` is a defensive fallback only."""
+        if self._persistent_pool is not None:
+            try:
+                self._persistent_pool.close()
+                self._persistent_pool.join()
+            finally:
+                self._persistent_pool = None
+                self._pool_n_workers = None
+
+    def __del__(self) -> None:
+        # Best-effort defensive cleanup. Must not raise — that breaks GC.
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def label_batch(
+        self,
+        images: list[np.ndarray],
+        n_workers: int = 0,
+    ) -> list[dict]:
+        """Label a batch of RGB images, returning ordered ``CVLabelResult.as_dict()``.
+
+        Args:
+            images: list of (H, W, 3) RGB arrays matching ``self.resolution``.
+            n_workers: 0 → sequential loop in this process (no pool overhead;
+                this is the default, drop-in equivalent to the per-image
+                ``label`` loop callers used to write).
+                ≥1 → spawn-context worker pool. The pool is created lazily on
+                the first call with ``n_workers > 0`` and PERSISTS across
+                subsequent calls with the same ``n_workers`` value, amortizing
+                the per-spawn cost across an episode. If a later call uses a
+                different ``n_workers``, the old pool is closed and a new one
+                spawned (a one-line warning is printed to stderr). Call
+                ``self.close()`` at end of use to tear down the pool.
+
+        Output order is guaranteed to match input order (we use ``pool.map``,
+        not ``imap_unordered``). Per-image semantics are bit-exact with
+        ``self.label(img).as_dict()`` — no preset, ICP-tolerance, or
+        morphology-kernel knob is touched in this method.
+        """
+        if n_workers <= 0:
+            return [self.label(img).as_dict() for img in images]
+        pool = self._get_or_create_pool(int(n_workers))
+        return pool.map(_worker_label, images)
 
 
 def label_image(

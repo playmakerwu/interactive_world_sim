@@ -79,6 +79,12 @@ class PushTWMEnv:
         cv_preset: CV labeler HSV preset. ``"REAL"`` matches the pink
             T-block under top-down ALOHA lighting and is the only
             preset validated for this WM.
+        cv_n_workers: when ``>= 1``, ``estimate_state`` runs the per-image
+            CV pipeline across a spawn-pool of this many workers. Default
+            ``0`` means sequential — bit-exact equivalent to the prior
+            per-image loop, no pool overhead. The threshold at which
+            workers pay off is N-dependent (see Step C of the cv-batching
+            sweep report); recommended only for ``n_sample >= 16``.
     """
 
     def __init__(
@@ -87,6 +93,7 @@ class PushTWMEnv:
         device: str = "cuda:0",
         resolution: int = DEFAULT_RES,
         cv_preset: str = "REAL",
+        cv_n_workers: int = 0,
     ) -> None:
         self.wm_ckpt_path = wm_ckpt_path
         self.device = device
@@ -94,6 +101,7 @@ class PushTWMEnv:
         self.image_diagonal = float(np.sqrt(resolution ** 2 + resolution ** 2))
         self._wm = DifferentiableDynamics(wm_ckpt_path, device=device)
         self._labeler = CVLabeler(preset=cv_preset, resolution=resolution)
+        self.cv_n_workers = int(cv_n_workers)
         # Action dim is fixed by the WM checkpoint; cached so callers don't
         # have to dig into hydra config.
         self.action_dim = 4
@@ -252,15 +260,22 @@ class PushTWMEnv:
                 arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
 
         N = arr.shape[0]
-        results = [self._labeler.label(arr[i]) for i in range(N)]
+        # label_batch returns list[dict] in input order. With n_workers=0
+        # (default), it's a sequential loop in this process — bit-exact
+        # with the prior per-image label() loop. With n_workers>=1, it
+        # uses a spawn pool; see CVLabeler.label_batch for the rationale.
+        images = [arr[i] for i in range(N)]
+        results = self._labeler.label_batch(images, n_workers=self.cv_n_workers)
 
         keys = ("cx", "cy", "sin_theta", "cos_theta", "theta_deg",
                 "contour_area", "icp_residual")
         out: dict[str, Any] = {}
         for k in keys:
-            vals = [getattr(r, k) if r.success else float("nan") for r in results]
+            vals = [r[k] if r["success"] else float("nan") for r in results]
             out[k] = torch.tensor(vals, dtype=torch.float32)
-        out["success"] = torch.tensor([r.success for r in results], dtype=torch.bool)
+        out["success"] = torch.tensor(
+            [r["success"] for r in results], dtype=torch.bool,
+        )
 
         if not was_batched:
             out = {k: v[0] for k, v in out.items()}

@@ -61,6 +61,11 @@ def _apply_cli_overrides(cfg, args) -> dict:
         cfg.seed = int(args.seed)
     if getattr(args, "decode_batch_size", None) is not None:
         cfg.decode_batch_size = int(args.decode_batch_size)
+    if getattr(args, "cv_n_workers", None) is not None:
+        # Infra/perf knob — does not change the CV pipeline numerically
+        # (label_batch is bit-exact at any worker count). Mutate cfg
+        # silently, no override_reason required.
+        cfg.cv_n_workers = int(args.cv_n_workers)
 
     if getattr(args, "n_sample", None) is not None and int(args.n_sample) != int(cfg.n_sample):
         config_deviation["changed"].append(
@@ -342,7 +347,11 @@ def _run_episode(
     if is_rank0:
         print(f"Effective config:\n{OmegaConf.to_yaml(cfg)}")
         print(f"Loading WM from {args.wm_ckpt}")
-    env = PushTWMEnv(args.wm_ckpt, device=device)
+    env = PushTWMEnv(
+        args.wm_ckpt,
+        device=device,
+        cv_n_workers=int(getattr(cfg, "cv_n_workers", 0) or 0),
+    )
 
     if is_rank0:
         print(
@@ -741,6 +750,16 @@ def main() -> None:
              "rewards are all-gathered before the softmax. Bit-identical "
              "first-action output to a single-GPU run at the same seed when "
              "n_sample is divisible by G. Not an algorithm deviation.",
+    )
+    ap.add_argument(
+        "--cv_n_workers", type=int, default=None,
+        help="Number of CPU worker processes for the batched CV labeler. "
+             "0 = sequential (default; bit-exact with the historical loop). "
+             ">0 = spawn-pool of this many workers per estimate_state call. "
+             "Infra/perf knob, NOT an algorithm change — no --override_reason "
+             "required. Pays off only for n_sample sufficiently large that "
+             "the CV time amortizes the spawn overhead; see the cv-batching "
+             "N-sweep report for the threshold.",
     )
     ap.add_argument(
         "--master_port", type=int, default=29500,
