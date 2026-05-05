@@ -84,8 +84,19 @@ class MPPIPlanner:
     def sample_action_sequences(self, act_seq: torch.Tensor) -> torch.Tensor:
         """``(H, A) -> (N, H, A)`` faithful port of reference sampler.
 
-        Reference: ``planner_v0_0.py:196-256``.
+        Reference: ``planner_v0_0.py:196-256``. When ``cfg.waypoints_n`` is
+        a positive int K < H, we instead sample (N, K, A) waypoint deltas
+        and interpolate to (N, H, A); see ``_sample_waypoints_then_interp``.
+        That mode mirrors reference's ``trajectory_optimization_mppi_waypts``
+        (``planner_v0_0.py:485-580``) adapted to our delta action space:
+        waypoints are deltas, interpolation produces smooth deltas, and the
+        downstream rollout/reward/MPPI-update operate on the (N, H, A)
+        result unchanged.
         """
+        K_wp = getattr(self.cfg, "waypoints_n", None)
+        if K_wp is not None and int(K_wp) > 0:
+            return self._sample_waypoints_then_interp(act_seq, int(K_wp))
+
         N = int(self.cfg.n_sample)
         H = int(self.cfg.n_look_ahead)
         A = int(self.cfg.action_dim)
@@ -110,6 +121,101 @@ class MPPIPlanner:
             act_seqs[:, i] = new_step
 
         return act_seqs
+
+    def _sample_waypoints_then_interp(
+        self, act_seq: torch.Tensor, K: int,
+    ) -> torch.Tensor:
+        """Sample K waypoint deltas, interpolate to H per-step deltas.
+
+        ``act_seq`` is the warm-started (H, A) running plan; we subsample
+        it at K equally-spaced indices to seed the waypoint mean, apply
+        the existing AR(1) Gaussian sampler with horizon=K, then up-sample
+        to (N, H, A). Interpolation is linear (default) or cubic (Catmull-Rom).
+        """
+        N = int(self.cfg.n_sample)
+        H = int(self.cfg.n_look_ahead)
+        A = int(self.cfg.action_dim)
+        beta = float(self.cfg.beta_filter)
+        sigma = float(self.cfg.noise_level)
+        mode = str(getattr(self.cfg, "waypoints_interp", "linear"))
+
+        assert 2 <= K < H, f"waypoints_n must be in [2, H-1]; got {K} (H={H})"
+        assert act_seq.shape == (H, A), (
+            f"act_seq must be (H={H}, A={A}); got {tuple(act_seq.shape)}"
+        )
+
+        # Waypoint timesteps: K integer indices spanning [0, H-1] inclusive.
+        t_wp = torch.linspace(0, H - 1, K).round().long().to(self.device)
+        # Deduplicate (e.g., if K > H - degenerate case is excluded by assert).
+        wp_base = act_seq.to(self.device)[t_wp]                # (K, A)
+
+        # AR(1) Gaussian sampling along the K-axis (mirrors per-step sampler).
+        wp_seqs = wp_base.unsqueeze(0).expand(N, -1, -1).clone()
+        residual = torch.zeros(N, A, dtype=wp_seqs.dtype, device=self.device)
+        for i in range(K):
+            noise = torch.randn(
+                (N, A), generator=self._gen, device=self.device,
+                dtype=wp_seqs.dtype,
+            ) * sigma
+            residual = beta * noise + (1.0 - beta) * residual
+            wp_seqs[:, i] = wp_seqs[:, i] + residual           # no per-waypt clamp
+
+        # Up-sample (N, K, A) -> (N, H, A) at integer timesteps 0..H-1.
+        t_out = torch.arange(H, device=self.device, dtype=torch.float32)
+        act_seqs = self._interp_along_dim(wp_seqs, t_wp.float(), t_out, mode=mode)
+        # Per-step clamp matches reference's per-step clamp on the action seq.
+        act_seqs = torch.clamp(act_seqs, self.action_lower_lim, self.action_upper_lim)
+        return act_seqs
+
+    @staticmethod
+    def _interp_along_dim(
+        wp: torch.Tensor, t_wp: torch.Tensor, t_out: torch.Tensor, mode: str,
+    ) -> torch.Tensor:
+        """Interpolate ``(N, K, A)`` waypoints at ``t_wp`` to ``(N, len(t_out), A)``.
+
+        ``mode`` ∈ {"linear", "cubic"}; "cubic" uses Catmull-Rom (cubic
+        Hermite through the four nearest waypoints). Both produce smooth
+        sequences in the sense that ``‖Δa‖₂`` between consecutive output
+        timesteps is bounded by the waypoint spacing rather than by the
+        per-step noise level.
+        """
+        N, K, A = wp.shape
+        # For each t_out, find the segment [t_wp[i], t_wp[i+1]] it falls in.
+        # We assume t_wp is sorted ascending integers.
+        # idx_lo = largest i such that t_wp[i] <= t_out (clamped to [0, K-2])
+        idx_lo = torch.clamp(
+            torch.searchsorted(t_wp, t_out, right=True) - 1, 0, K - 2
+        )
+        idx_hi = idx_lo + 1
+        t_lo = t_wp[idx_lo]
+        t_hi = t_wp[idx_hi]
+        u = ((t_out - t_lo) / (t_hi - t_lo).clamp_min(1e-6)).clamp(0.0, 1.0)  # (T,)
+
+        if mode == "linear":
+            # Pick (N, T, A) waypoints at idx_lo and idx_hi.
+            w_lo = wp[:, idx_lo, :]
+            w_hi = wp[:, idx_hi, :]
+            return w_lo + (w_hi - w_lo) * u.unsqueeze(0).unsqueeze(-1)
+
+        if mode == "cubic":
+            # Catmull-Rom: needs i-1 and i+2 with edge-clamping.
+            idx_prev = torch.clamp(idx_lo - 1, 0, K - 1)
+            idx_next = torch.clamp(idx_hi + 1, 0, K - 1)
+            w_prev = wp[:, idx_prev, :]                        # (N, T, A)
+            w_lo   = wp[:, idx_lo,   :]
+            w_hi   = wp[:, idx_hi,   :]
+            w_next = wp[:, idx_next, :]
+            u3 = u.unsqueeze(0).unsqueeze(-1)
+            u2 = u3 * u3
+            u1 = u2 * u3
+            return 0.5 * (
+                (2.0 * w_lo)
+                + (-w_prev + w_hi) * u3
+                + (2.0 * w_prev - 5.0 * w_lo + 4.0 * w_hi - w_next) * u2
+                + (-w_prev + 3.0 * w_lo - 3.0 * w_hi + w_next) * u1
+            )
+
+        raise ValueError(f"unknown waypoints_interp: {mode!r}")
 
     def optimize_action_mppi(
         self,

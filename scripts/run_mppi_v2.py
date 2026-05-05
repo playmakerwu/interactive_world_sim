@@ -375,7 +375,7 @@ def _run_episode(
 
     # ── main control loop ──
     trajectory_latents: list[torch.Tensor] = [z.cpu().clone()]
-    converged_plans: list[torch.Tensor] = []   # (control_steps, H, A)
+    converged_plans: list[torch.Tensor] = []   # (n_plan_calls, H, A); equals control_steps when STEP_EACH_ITER=1
     iteration_logs: list[list[dict[str, Any]]] = []
     rgb_frames: list[np.ndarray] = []
     per_step: list[dict] = []
@@ -410,60 +410,87 @@ def _run_episode(
     act_seq_running = torch.zeros(H, A, device=env.device, dtype=torch.float32)
 
     t0_run = time.time()
-    for t in range(int(cfg.control_steps)):
-        t0_step = time.time()
+    n_actions_done = 0
+    while n_actions_done < int(cfg.control_steps):
+        # Number of actions executed during this trajectory_optimization
+        # call. With the default STEP_EACH_ITER=1 this is always 1
+        # (bit-equivalent to the pre-refactor loop). With STEP_EACH_ITER=N
+        # the planner is called ceil(control_steps/N) times and N actions
+        # are executed per call (matches reference exp_sim_control.py
+        # lines 108, 151-155, 219-220). The final call may execute fewer
+        # than N when control_steps % N != 0.
+        n_this = min(int(STEP_EACH_ITER), int(cfg.control_steps) - n_actions_done)
+
+        t0_plan = time.time()
         init_act = act_seq_running if USE_WARM_START else None
         a, iter_log = planner.plan_step(
             z, goal, init_act_seq=init_act, return_iteration_log=True,
         )                                           # (action_dim,), list[n_iter]
-        z = env.dynamics_step(z, a)                 # (C, H_lat, W_lat)
-
         # ``planner.last_stats.act_seq`` lives on CPU as (H, A); every rank
         # has bit-identical bytes (see mppi_planner.optimize_action_mppi
-        # determinism note). Capture before the warm-start mutation below.
+        # determinism note). Capture before any warm-start mutation.
         converged = planner.last_stats.act_seq.detach().cpu().clone()
+        plan_wall = time.time() - t0_plan
 
-        if USE_WARM_START:
-            # Shift-and-pad: drop the executed prefix (STEP_EACH_ITER steps)
-            # and repeat the last action to fill the tail.
-            converged_dev = converged.to(env.device)
-            new_tail = converged_dev[-1:].repeat(STEP_EACH_ITER, 1)
-            act_seq_running = torch.cat(
-                [converged_dev[STEP_EACH_ITER:], new_tail], dim=0
-            )
-        wall = time.time() - t0_step
+        # Execute n_this actions sequentially against the WM. ``a`` is the
+        # planner's returned first action (== converged[0]); use it for
+        # s=0 to keep the SEI=1 path bit-identical, and converged[s] for
+        # subsequent sub-steps.
+        for s in range(n_this):
+            a_s = a if s == 0 else converged[s].to(env.device)
+            z = env.dynamics_step(z, a_s)
+            if is_rank0:
+                rgb_t = env.decode(z)
+                rgb_t_u8 = (
+                    rgb_t.clamp(0, 1).cpu().numpy() * 255
+                ).astype(np.uint8).transpose(1, 2, 0)
+                state_t = env.estimate_state(rgb_t)
+                r_t = env.compute_reward(
+                    state_t, goal,
+                    cv_fail_penalty=float(cfg.cv_fail_penalty),
+                )
+                trajectory_latents.append(z.cpu().clone())
+                rgb_frames.append(rgb_t_u8)
+                # plan_wall_s is recorded on the first sub-step of each
+                # plan call; subsequent sub-steps within the same plan
+                # report 0.0 so summing per_step still yields total plan
+                # wall time.
+                per_step.append({
+                    "t": n_actions_done + s + 1,
+                    "action": [float(v) for v in a_s.tolist()],
+                    "reward": float(r_t),
+                    "cv_success": bool(state_t["success"]),
+                    "cx": float(state_t["cx"]) if state_t["success"] else None,
+                    "cy": float(state_t["cy"]) if state_t["success"] else None,
+                    "theta_deg": float(state_t["theta_deg"]) if state_t["success"] else None,
+                    "plan_wall_s": round(plan_wall, 3) if s == 0 else 0.0,
+                })
+                print(
+                    f"  t={n_actions_done + s + 1:02d}  r={float(r_t):+.4f}  "
+                    + (
+                        f"cv=({float(state_t['cx']):.1f},{float(state_t['cy']):.1f},"
+                        f"{float(state_t['theta_deg']):+.1f}deg)"
+                        if state_t['success'] else "CV-FAIL"
+                    )
+                    + (f"  plan={plan_wall:.2f}s" if s == 0 else "  (sub-step)")
+                )
 
         if is_rank0:
-            rgb_t = env.decode(z)
-            rgb_t_u8 = (
-                rgb_t.clamp(0, 1).cpu().numpy() * 255
-            ).astype(np.uint8).transpose(1, 2, 0)
-            state_t = env.estimate_state(rgb_t)
-            r_t = env.compute_reward(state_t, goal, cv_fail_penalty=float(cfg.cv_fail_penalty))
-
-            trajectory_latents.append(z.cpu().clone())
+            # One converged plan + one iter_log per plan_step call.
             converged_plans.append(converged)
             iteration_logs.append(iter_log)
-            rgb_frames.append(rgb_t_u8)
-            per_step.append({
-                "t": t + 1,
-                "action": [float(v) for v in a.tolist()],
-                "reward": float(r_t),
-                "cv_success": bool(state_t["success"]),
-                "cx": float(state_t["cx"]) if state_t["success"] else None,
-                "cy": float(state_t["cy"]) if state_t["success"] else None,
-                "theta_deg": float(state_t["theta_deg"]) if state_t["success"] else None,
-                "plan_wall_s": round(wall, 3),
-            })
-            print(
-                f"  t={t+1:02d}  r={float(r_t):+.4f}  "
-                + (
-                    f"cv=({float(state_t['cx']):.1f},{float(state_t['cy']):.1f},"
-                    f"{float(state_t['theta_deg']):+.1f}deg)"
-                    if state_t['success'] else "CV-FAIL"
-                )
-                + f"  plan={wall:.2f}s"
+
+        if USE_WARM_START:
+            # Shift-and-pad by n_this (the number of actions actually
+            # executed this call) — equals STEP_EACH_ITER except on a
+            # final partial call when control_steps % SEI != 0.
+            converged_dev = converged.to(env.device)
+            new_tail = converged_dev[-1:].repeat(n_this, 1)
+            act_seq_running = torch.cat(
+                [converged_dev[n_this:], new_tail], dim=0
             )
+
+        n_actions_done += n_this
 
     if not is_rank0:
         # Non-rank-0 workers exit here — they do not write artifacts.
@@ -474,10 +501,13 @@ def _run_episode(
 
     # ── save artifacts ──
     torch.save(torch.stack(trajectory_latents), out_dir / "trajectory_latents.pt")
-    # action_history.pt schema: (control_steps, H, A) -- the FULL converged
-    # plan from each plan_step. Slice [:, 0, :] to recover executed actions.
-    # Bumped from (T, A) so downstream debug/replay tools can inspect the
-    # entire planner output, not just the head.
+    # action_history.pt schema: (n_plan_calls, H, A) -- the FULL converged
+    # plan from each MPPI call. With STEP_EACH_ITER=1 this equals
+    # control_steps and slice [:, 0, :] recovers the executed sequence.
+    # With STEP_EACH_ITER>1 the leading axis is ceil(control_steps/SEI)
+    # and slice [:, :SEI, :] (flattened) recovers the executed sequence
+    # (modulo the final partial call). Bumped from (T, A) so downstream
+    # debug/replay tools can inspect the entire planner output.
     torch.save(torch.stack(converged_plans), out_dir / "action_history.pt")
     torch.save(trajectory_latents[0], out_dir / "initial_latent.pt")
     torch.save(iteration_logs, out_dir / "iteration_log.pt")

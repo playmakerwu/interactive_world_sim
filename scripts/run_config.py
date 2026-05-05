@@ -25,9 +25,12 @@ comparison.
 STEP_EACH_ITER: int = 1
 """Number of actions executed between consecutive ``plan_step`` calls.
 
-This is the shift size for the warm-start shift-and-pad. Verified by
-reading ``scripts/run_mppi_v2.py``: each loop iteration calls
-``env.dynamics_step(z, a)`` exactly once between ``planner.plan_step(...)``
-calls. Upstream uses 5 because their loop executes 5 actions per plan; we
-execute 1.
+The MPPI run loop in ``scripts/run_mppi_v2.py`` calls
+``planner.plan_step(...)`` once and then executes ``STEP_EACH_ITER``
+consecutive actions from the converged plan via ``env.dynamics_step``
+before re-planning. The warm-start shift-and-pad uses the same value
+(matches reference ``exp_sim_control.py:108, 151-155, 219-220``). The
+total number of executed actions in an episode is ``cfg.control_steps``
+regardless of this knob; with ``STEP_EACH_ITER=N`` the number of MPPI
+calls is ``ceil(control_steps / N)``.
 """

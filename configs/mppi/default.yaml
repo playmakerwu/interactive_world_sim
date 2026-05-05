@@ -23,6 +23,18 @@ beta_filter: 0.7          # Intra-horizon noise smoothing coefficient.
                           # for the (mis)understanding history. Matches reference.
 cv_fail_penalty: -10.0    # Reward for CV-failed trajectories.
 
+# --- waypoint sampling (off by default = vanilla MPPI) ---
+waypoints_n: null         # K: number of sparse waypoints in delta space.
+                          # When null, sample (N, H, A) per-step deltas
+                          # directly (faithful port). When set to an int
+                          # 2..H-1, sample (N, K, A) waypoint deltas and
+                          # up-sample to (N, H, A) via the chosen interp,
+                          # mirroring the reference's MPPI_WAYPTS variant
+                          # (planner_v0_0.py:485-580) adapted to delta
+                          # action space. Smoothness lever: K=H/4 typically
+                          # cuts plan ‖Δa‖ by ~(H/K)×.
+waypoints_interp: linear  # "linear" or "cubic" (Catmull-Rom).
+
 # --- action space ---
 action_dim: 4             # ALOHA bimanual end-effector deltas.
                           # Matches outputs/pusht_cam1/.hydra/config.yaml:105.
