@@ -409,6 +409,36 @@ def _run_episode(
     A = int(cfg.action_dim)
     act_seq_running = torch.zeros(H, A, device=env.device, dtype=torch.float32)
 
+    # Delta-mode state-anchored MPPI. When delta_mode=true, the planner
+    # samples per-step deltas; the runner cumulatively integrates them
+    # onto an anchor read from the initial hdf5 frame to recover absolute
+    # targets that the WM consumes. Anchor is in normalized-action space
+    # (the same space MPPI cube lives in). See
+    # outputs/diagnostics/demo_action_stats_*.md for the empirical bounds.
+    delta_mode = bool(getattr(cfg, "delta_mode", False))
+    cumulative_drift_log: list[float] = []
+    if delta_mode:
+        # Read raw action at frame_idx-1 (or frame_idx if at episode start)
+        # and apply the WM's training-time normalizer to land in the same
+        # space MPPI samples in. ee_pos is not loaded directly because
+        # PushTWMEnv does not expose it (see ee_pos_access_audit_*.md).
+        anchor_frame = max(0, int(args.initial_frame) - 1)
+        import h5py as _h5py
+        with _h5py.File(args.initial_hdf5, "r") as _f:
+            raw_anchor_np = _f["action"][anchor_frame]
+        raw_anchor = torch.as_tensor(
+            raw_anchor_np, dtype=torch.float32,
+        )  # (A,) raw
+        anchor_norm = env._wm.normalizer["action"].normalize(
+            raw_anchor.unsqueeze(0)
+        ).squeeze(0).to(device=env.device, dtype=torch.float32)  # (A,)
+        anchor_initial = anchor_norm.clone()  # never mutated; for drift log
+        if is_rank0:
+            print(
+                f"[delta_mode] anchor from frame {anchor_frame}: "
+                f"raw={raw_anchor.tolist()}  normalized={anchor_norm.tolist()}"
+            )
+
     t0_run = time.time()
     n_actions_done = 0
     while n_actions_done < int(cfg.control_steps):
@@ -432,13 +462,30 @@ def _run_episode(
         converged = planner.last_stats.act_seq.detach().cpu().clone()
         plan_wall = time.time() - t0_plan
 
-        # Execute n_this actions sequentially against the WM. ``a`` is the
-        # planner's returned first action (== converged[0]); use it for
-        # s=0 to keep the SEI=1 path bit-identical, and converged[s] for
-        # subsequent sub-steps.
+        # Execute n_this actions sequentially against the WM. In abs-mode
+        # ``converged`` is the planner's absolute-action plan (a == converged[0]);
+        # in delta-mode ``converged`` is a per-step delta plan that we
+        # cumsum onto the running anchor to recover absolute targets the
+        # WM was trained on. Both modes feed env.dynamics_step the same
+        # absolute-action shape; only the source of the action differs.
+        if delta_mode:
+            converged_dev = converged.to(env.device)
+            abs_seq = anchor_norm.unsqueeze(0) + converged_dev.cumsum(dim=0)  # (H, A)
         for s in range(n_this):
-            a_s = a if s == 0 else converged[s].to(env.device)
+            if delta_mode:
+                a_s = abs_seq[s]
+            else:
+                a_s = a if s == 0 else converged[s].to(env.device)
             z = env.dynamics_step(z, a_s)
+            if delta_mode:
+                # Diagnostic: cumulative drift from initial anchor
+                drift = float((a_s - anchor_initial).norm().item())
+                cumulative_drift_log.append(drift)
+                if drift > 1.83:  # demo p99 50-step coverage
+                    print(
+                        f"[delta_mode WARN] t={n_actions_done + s + 1} "
+                        f"cumulative drift {drift:.3f} > demo p99 1.83"
+                    )
             if is_rank0:
                 rgb_t = env.decode(z)
                 rgb_t_u8 = (
@@ -464,6 +511,7 @@ def _run_episode(
                     "cy": float(state_t["cy"]) if state_t["success"] else None,
                     "theta_deg": float(state_t["theta_deg"]) if state_t["success"] else None,
                     "plan_wall_s": round(plan_wall, 3) if s == 0 else 0.0,
+                    "cumulative_drift": round(cumulative_drift_log[-1], 4) if delta_mode else None,
                 })
                 print(
                     f"  t={n_actions_done + s + 1:02d}  r={float(r_t):+.4f}  "
@@ -483,12 +531,26 @@ def _run_episode(
         if USE_WARM_START:
             # Shift-and-pad by n_this (the number of actions actually
             # executed this call) — equals STEP_EACH_ITER except on a
-            # final partial call when control_steps % SEI != 0.
+            # final partial call when control_steps % SEI != 0. In
+            # delta-mode the running plan is itself a delta sequence;
+            # pad with zeros (= "no further movement") instead of
+            # repeating the last delta to avoid runaway accumulation.
             converged_dev = converged.to(env.device)
-            new_tail = converged_dev[-1:].repeat(n_this, 1)
+            if delta_mode:
+                new_tail = torch.zeros(
+                    n_this, A, device=env.device, dtype=torch.float32,
+                )
+            else:
+                new_tail = converged_dev[-1:].repeat(n_this, 1)
             act_seq_running = torch.cat(
                 [converged_dev[n_this:], new_tail], dim=0
             )
+
+        if delta_mode:
+            # Advance anchor by the deltas we just executed (the cumsum
+            # from the plan up through n_this-1). Subsequent plan calls
+            # will integrate from this point.
+            anchor_norm = abs_seq[n_this - 1].detach().clone()
 
         n_actions_done += n_this
 
@@ -603,6 +665,14 @@ def _run_episode(
         "wall_time_s": round(wall_total, 1),
         "wall_per_step_s": round(wall_total / max(1, int(cfg.control_steps)), 3),
         "n_gpus": int(getattr(args, "n_gpus", 1) or 1),
+        "delta_mode": bool(delta_mode),
+        "cumulative_drift_log": (
+            [round(v, 4) for v in cumulative_drift_log] if delta_mode else None
+        ),
+        "cumulative_drift_max": (
+            round(max(cumulative_drift_log), 4)
+            if delta_mode and cumulative_drift_log else None
+        ),
         "per_step": per_step,
     }
     summary["iteration_reward_viz"] = _write_iteration_visualizations(

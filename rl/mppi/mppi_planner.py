@@ -101,7 +101,10 @@ class MPPIPlanner:
         H = int(self.cfg.n_look_ahead)
         A = int(self.cfg.action_dim)
         beta = float(self.cfg.beta_filter)
-        sigma = float(self.cfg.noise_level)
+        # Delta-mode picks tighter bounds + smaller sigma so sampled
+        # sequences live on the demo per-step Δa manifold. AR(1) math is
+        # otherwise identical to absolute-mode sampling.
+        sigma, lo, hi = self._sampler_sigma_and_bounds(A)
 
         assert act_seq.shape == (H, A), (
             f"act_seq must be (H={H}, A={A}); got {tuple(act_seq.shape)}"
@@ -117,10 +120,24 @@ class MPPIPlanner:
             ) * sigma
             act_residual = beta * noise_sample + (1.0 - beta) * act_residual
             new_step = act_seqs[:, i] + act_residual
-            new_step = torch.clamp(new_step, self.action_lower_lim, self.action_upper_lim)
+            new_step = torch.clamp(new_step, lo, hi)
             act_seqs[:, i] = new_step
 
         return act_seqs
+
+    def _sampler_sigma_and_bounds(self, A: int):
+        """Pick noise sigma and per-step clip bounds for the active mode.
+
+        delta_mode=True: sigma = noise_level_delta; bounds = ±delta_action_lim per dim.
+        delta_mode=False (default): sigma = noise_level; bounds = action_{lower,upper}_lim.
+        """
+        if bool(getattr(self.cfg, "delta_mode", False)):
+            sigma = float(self.cfg.noise_level_delta)
+            lim = float(self.cfg.delta_action_lim)
+            lo = torch.full((A,), -lim, dtype=torch.float32, device=self.device)
+            hi = torch.full((A,),  lim, dtype=torch.float32, device=self.device)
+            return sigma, lo, hi
+        return float(self.cfg.noise_level), self.action_lower_lim, self.action_upper_lim
 
     def _sample_waypoints_then_interp(
         self, act_seq: torch.Tensor, K: int,
@@ -136,7 +153,7 @@ class MPPIPlanner:
         H = int(self.cfg.n_look_ahead)
         A = int(self.cfg.action_dim)
         beta = float(self.cfg.beta_filter)
-        sigma = float(self.cfg.noise_level)
+        sigma, lo, hi = self._sampler_sigma_and_bounds(A)
         mode = str(getattr(self.cfg, "waypoints_interp", "linear"))
 
         assert 2 <= K < H, f"waypoints_n must be in [2, H-1]; got {K} (H={H})"
@@ -164,7 +181,7 @@ class MPPIPlanner:
         t_out = torch.arange(H, device=self.device, dtype=torch.float32)
         act_seqs = self._interp_along_dim(wp_seqs, t_wp.float(), t_out, mode=mode)
         # Per-step clamp matches reference's per-step clamp on the action seq.
-        act_seqs = torch.clamp(act_seqs, self.action_lower_lim, self.action_upper_lim)
+        act_seqs = torch.clamp(act_seqs, lo, hi)
         return act_seqs
 
     @staticmethod
