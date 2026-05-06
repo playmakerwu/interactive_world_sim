@@ -410,30 +410,31 @@ def _run_episode(
     A = int(cfg.action_dim)
     act_seq_running = torch.zeros(H, A, device=env.device, dtype=torch.float32)
 
-    # Delta-mode state-anchored MPPI. When delta_mode=true, the planner
-    # samples per-step deltas; the runner cumulatively integrates them
-    # onto an anchor read from the initial hdf5 frame to recover absolute
-    # targets that the WM consumes. Anchor is in normalized-action space
-    # (the same space MPPI cube lives in). See
-    # outputs/diagnostics/demo_action_stats_*.md for the empirical bounds.
+    # Delta-mode (state-anchored MPPI). The planner internally cumsum-
+    # integrates sampled per-step deltas onto an anchor and clamps the
+    # resulting absolute trajectory to the cube before WM rollout. The
+    # runner just reads the anchor from hdf5 and advances it between
+    # plan_step calls — no caller-side integration. See
+    # outputs/diagnostics/demo_action_stats_*.md for empirical bounds and
+    # outputs/diagnostics/clip_logic_audit_*.md for design rationale.
     delta_mode = bool(getattr(cfg, "delta_mode", False))
     cumulative_drift_log: list[float] = []
+    anchor_norm: torch.Tensor | None = None
+    anchor_initial: torch.Tensor | None = None
     if delta_mode:
-        # Read raw action at frame_idx-1 (or frame_idx if at episode start)
-        # and apply the WM's training-time normalizer to land in the same
-        # space MPPI samples in. ee_pos is not loaded directly because
-        # PushTWMEnv does not expose it (see ee_pos_access_audit_*.md).
+        # Read raw action at frame_idx-1 (the action that took us into
+        # the initial state; or frame 0 at episode start). Apply the WM's
+        # training-time normalizer to land in the same space MPPI samples
+        # operate in.
         anchor_frame = max(0, int(args.initial_frame) - 1)
         import h5py as _h5py
         with _h5py.File(args.initial_hdf5, "r") as _f:
             raw_anchor_np = _f["action"][anchor_frame]
-        raw_anchor = torch.as_tensor(
-            raw_anchor_np, dtype=torch.float32,
-        )  # (A,) raw
+        raw_anchor = torch.as_tensor(raw_anchor_np, dtype=torch.float32)
         anchor_norm = env._wm.normalizer["action"].normalize(
             raw_anchor.unsqueeze(0)
-        ).squeeze(0).to(device=env.device, dtype=torch.float32)  # (A,)
-        anchor_initial = anchor_norm.clone()  # never mutated; for drift log
+        ).squeeze(0).to(device=env.device, dtype=torch.float32)
+        anchor_initial = anchor_norm.clone()
         if is_rank0:
             print(
                 f"[delta_mode] anchor from frame {anchor_frame}: "
@@ -457,30 +458,25 @@ def _run_episode(
         init_act = act_seq_running if USE_WARM_START else None
         a, iter_log = planner.plan_step(
             z, goal, init_act_seq=init_act, return_iteration_log=True,
+            anchor=anchor_norm,  # required in delta_mode; ignored in vanilla
         )                                           # (action_dim,), list[n_iter]
         # ``planner.last_stats.act_seq`` lives on CPU as (H, A); every rank
         # has bit-identical bytes (see mppi_planner.optimize_action_mppi
-        # determinism note). Capture before any warm-start mutation.
+        # determinism note). It is ABSOLUTE in both modes — the delta_mode
+        # cumsum + cube clamp happens inside the planner before WM scoring.
         converged = planner.last_stats.act_seq.detach().cpu().clone()
         plan_wall = time.time() - t0_plan
 
-        # Execute n_this actions sequentially against the WM. In abs-mode
-        # ``converged`` is the planner's absolute-action plan (a == converged[0]);
-        # in delta-mode ``converged`` is a per-step delta plan that we
-        # cumsum onto the running anchor to recover absolute targets the
-        # WM was trained on. Both modes feed env.dynamics_step the same
-        # absolute-action shape; only the source of the action differs.
-        if delta_mode:
-            converged_dev = converged.to(env.device)
-            abs_seq = anchor_norm.unsqueeze(0) + converged_dev.cumsum(dim=0)  # (H, A)
+        # Execute n_this absolute actions against the WM. ``converged`` is
+        # an absolute trajectory in the cube regardless of mode (the planner
+        # is mode-agnostic in its return contract). a == converged[0].
         for s in range(n_this):
-            if delta_mode:
-                a_s = abs_seq[s]
-            else:
-                a_s = a if s == 0 else converged[s].to(env.device)
+            a_s = a if s == 0 else converged[s].to(env.device)
             z = env.dynamics_step(z, a_s)
             if delta_mode:
-                # Diagnostic: cumulative drift from initial anchor
+                # Diagnostic: cumulative drift from initial anchor.
+                # Logged-only; the cube clamp inside the planner is the
+                # actual safety bound.
                 drift = float((a_s - anchor_initial).norm().item())
                 cumulative_drift_log.append(drift)
                 if drift > 1.83:  # demo p99 50-step coverage
@@ -531,28 +527,28 @@ def _run_episode(
             iteration_logs.append(iter_log)
 
         if USE_WARM_START:
-            # Shift-and-pad by n_this (the number of actions actually
-            # executed this call) — equals step_each_iter except on a
-            # final partial call when control_steps % step_each_iter != 0. In
-            # delta-mode the running plan is itself a delta sequence;
-            # pad with zeros (= "no further movement") instead of
-            # repeating the last delta to avoid runaway accumulation.
+            # Shift-and-pad by n_this. In delta_mode the warm-start
+            # carried back to the planner is the residual delta plan
+            # the optimizer would re-perturb; we cold-restart with zeros
+            # (no carry) since the anchor advancement encodes "where we
+            # are" and the planner now does the cumsum internally.
+            # In vanilla, repeat-last-action is the reference behavior.
             converged_dev = converged.to(env.device)
             if delta_mode:
-                new_tail = torch.zeros(
-                    n_this, A, device=env.device, dtype=torch.float32,
+                act_seq_running = torch.zeros(
+                    H, A, device=env.device, dtype=torch.float32,
                 )
             else:
                 new_tail = converged_dev[-1:].repeat(n_this, 1)
-            act_seq_running = torch.cat(
-                [converged_dev[n_this:], new_tail], dim=0
-            )
+                act_seq_running = torch.cat(
+                    [converged_dev[n_this:], new_tail], dim=0
+                )
 
         if delta_mode:
-            # Advance anchor by the deltas we just executed (the cumsum
-            # from the plan up through n_this-1). Subsequent plan calls
-            # will integrate from this point.
-            anchor_norm = abs_seq[n_this - 1].detach().clone()
+            # Advance anchor to the last absolute action we just executed
+            # (already in the cube — the planner's clamp ran). Subsequent
+            # plan calls will integrate sampled deltas from this point.
+            anchor_norm = converged[n_this - 1].to(env.device).detach().clone()
 
         n_actions_done += n_this
 

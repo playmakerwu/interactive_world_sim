@@ -79,19 +79,46 @@ class MPPIPlanner:
         self._gen = torch.Generator(device=self.device)
         self._gen.manual_seed(int(self.cfg.seed))
 
+        # Anchor for delta_mode. Caller sets via set_anchor() before each
+        # plan_step. None in vanilla mode (delta_mode=False).
+        self._anchor: torch.Tensor | None = None
+
+    def set_anchor(self, anchor: torch.Tensor) -> None:
+        """Set the absolute-action anchor for delta_mode integration.
+
+        Must be called before plan_step when delta_mode=True. Anchor is
+        the current absolute action (in normalized [-1,+1] space) from
+        which sampled deltas will be cumsum-integrated.
+        """
+        self._anchor = anchor.to(
+            device=self.device, dtype=torch.float32,
+        ).clone().detach()
+
     # ── primitives ───────────────────────────────────────────────────
 
     def sample_action_sequences(self, act_seq: torch.Tensor) -> torch.Tensor:
-        """``(H, A) -> (N, H, A)`` faithful port of reference sampler.
+        """``(H, A) -> (N, H, A)`` of ABSOLUTE action sequences.
 
-        Reference: ``planner_v0_0.py:196-256``. When ``cfg.waypoints_n`` is
-        a positive int K < H, we instead sample (N, K, A) waypoint deltas
-        and interpolate to (N, H, A); see ``_sample_waypoints_then_interp``.
-        That mode mirrors reference's ``trajectory_optimization_mppi_waypts``
-        (``planner_v0_0.py:485-580``) adapted to our delta action space:
-        waypoints are deltas, interpolation produces smooth deltas, and the
-        downstream rollout/reward/MPPI-update operate on the (N, H, A)
-        result unchanged.
+        In vanilla mode (delta_mode=False), this is a faithful port of
+        reference ``planner_v0_0.py:196-256``: AR(1) Gaussian perturbation
+        on absolute actions with per-step clamp to ``[action_lower_lim,
+        action_upper_lim]``.
+
+        In delta mode, the same AR(1) loop generates per-step deltas
+        clamped to ``±delta_action_lim``, then we cumsum-integrate them
+        onto ``self._anchor`` and clamp the resulting absolute sequence
+        to the cube. This way the WM rollout during MPPI scoring sees the
+        same absolute actions that will be executed at the env (fixes
+        the planning/execution mismatch from the prior delta_mode
+        implementation).
+
+        When ``cfg.waypoints_n`` is a positive int K < H, sampling is
+        delegated to ``_sample_waypoints_then_interp`` which applies the
+        same delta_mode integration after waypoint up-sampling.
+
+        Returns: ``(N, H, A)`` absolute actions in
+        ``[action_lower_lim, action_upper_lim]`` (the cube), regardless
+        of mode.
         """
         K_wp = getattr(self.cfg, "waypoints_n", None)
         if K_wp is not None and int(K_wp) > 0:
@@ -101,9 +128,7 @@ class MPPIPlanner:
         H = int(self.cfg.n_look_ahead)
         A = int(self.cfg.action_dim)
         beta = float(self.cfg.beta_filter)
-        # Delta-mode picks tighter bounds + smaller sigma so sampled
-        # sequences live on the demo per-step Δa manifold. AR(1) math is
-        # otherwise identical to absolute-mode sampling.
+        delta_mode = bool(getattr(self.cfg, "delta_mode", False))
         sigma, lo, hi = self._sampler_sigma_and_bounds(A)
 
         assert act_seq.shape == (H, A), (
@@ -120,8 +145,30 @@ class MPPIPlanner:
             ) * sigma
             act_residual = beta * noise_sample + (1.0 - beta) * act_residual
             new_step = act_seqs[:, i] + act_residual
+            # In vanilla, lo/hi are ±1 (cube) and clamping the absolute
+            # is correct. In delta_mode, lo/hi are ±delta_action_lim and
+            # we are clamping per-step deltas; the cube clamp on the
+            # integrated absolute happens below.
             new_step = torch.clamp(new_step, lo, hi)
             act_seqs[:, i] = new_step
+
+        if delta_mode:
+            if self._anchor is None:
+                raise RuntimeError(
+                    "sample_action_sequences: delta_mode=True requires "
+                    "planner.set_anchor(...) before plan_step. Got "
+                    "self._anchor=None."
+                )
+            # act_seqs holds per-step deltas clamped to ±delta_action_lim.
+            # Cumsum-integrate onto anchor, then clamp the absolute path
+            # to the cube. The WM rollout that scores these samples will
+            # see exactly what the env executes — no planning/execution
+            # mismatch.
+            abs_seqs = self._anchor.view(1, 1, -1) + act_seqs.cumsum(dim=1)
+            abs_seqs = torch.clamp(
+                abs_seqs, self.action_lower_lim, self.action_upper_lim,
+            )
+            return abs_seqs
 
         return act_seqs
 
@@ -129,7 +176,10 @@ class MPPIPlanner:
         """Pick noise sigma and per-step clip bounds for the active mode.
 
         delta_mode=True: sigma = noise_level_delta; bounds = ±delta_action_lim per dim.
+          (Per-step DELTA bounds — not absolute. Absolute clamp happens
+          after cumsum integration in sample_action_sequences.)
         delta_mode=False (default): sigma = noise_level; bounds = action_{lower,upper}_lim.
+          (Absolute cube bounds.)
         """
         if bool(getattr(self.cfg, "delta_mode", False)):
             sigma = float(self.cfg.noise_level_delta)
@@ -142,17 +192,21 @@ class MPPIPlanner:
     def _sample_waypoints_then_interp(
         self, act_seq: torch.Tensor, K: int,
     ) -> torch.Tensor:
-        """Sample K waypoint deltas, interpolate to H per-step deltas.
+        """Sample K waypoints, interpolate to H per-step actions.
 
         ``act_seq`` is the warm-started (H, A) running plan; we subsample
         it at K equally-spaced indices to seed the waypoint mean, apply
         the existing AR(1) Gaussian sampler with horizon=K, then up-sample
         to (N, H, A). Interpolation is linear (default) or cubic (Catmull-Rom).
+
+        Returns ``(N, H, A)`` ABSOLUTE action sequences in the cube,
+        regardless of mode (mirrors ``sample_action_sequences``).
         """
         N = int(self.cfg.n_sample)
         H = int(self.cfg.n_look_ahead)
         A = int(self.cfg.action_dim)
         beta = float(self.cfg.beta_filter)
+        delta_mode = bool(getattr(self.cfg, "delta_mode", False))
         sigma, lo, hi = self._sampler_sigma_and_bounds(A)
         mode = str(getattr(self.cfg, "waypoints_interp", "linear"))
 
@@ -163,7 +217,6 @@ class MPPIPlanner:
 
         # Waypoint timesteps: K integer indices spanning [0, H-1] inclusive.
         t_wp = torch.linspace(0, H - 1, K).round().long().to(self.device)
-        # Deduplicate (e.g., if K > H - degenerate case is excluded by assert).
         wp_base = act_seq.to(self.device)[t_wp]                # (K, A)
 
         # AR(1) Gaussian sampling along the K-axis (mirrors per-step sampler).
@@ -180,8 +233,24 @@ class MPPIPlanner:
         # Up-sample (N, K, A) -> (N, H, A) at integer timesteps 0..H-1.
         t_out = torch.arange(H, device=self.device, dtype=torch.float32)
         act_seqs = self._interp_along_dim(wp_seqs, t_wp.float(), t_out, mode=mode)
-        # Per-step clamp matches reference's per-step clamp on the action seq.
+        # Per-step clamp: in vanilla, lo/hi are ±1 (cube — correct). In
+        # delta_mode, lo/hi are ±delta_action_lim and we clamp the
+        # interpolated per-step deltas; absolute clamp happens after
+        # cumsum below.
         act_seqs = torch.clamp(act_seqs, lo, hi)
+
+        if delta_mode:
+            if self._anchor is None:
+                raise RuntimeError(
+                    "_sample_waypoints_then_interp: delta_mode=True requires "
+                    "planner.set_anchor(...) before plan_step."
+                )
+            abs_seqs = self._anchor.view(1, 1, -1) + act_seqs.cumsum(dim=1)
+            abs_seqs = torch.clamp(
+                abs_seqs, self.action_lower_lim, self.action_upper_lim,
+            )
+            return abs_seqs
+
         return act_seqs
 
     @staticmethod
@@ -497,18 +566,37 @@ class MPPIPlanner:
         goal_state: dict[str, Any],
         init_act_seq: torch.Tensor | None = None,
         return_iteration_log: bool = False,
+        *,
+        anchor: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[dict[str, Any]]]:
-        """Run trajectory optimization and return the first action.
+        """Run trajectory optimization and return the first absolute action.
 
         Args:
             z_current: current latent.
             goal_state: scalar goal-state dict.
-            init_act_seq: optional initial action sequence.
+            init_act_seq: optional initial action sequence. In vanilla
+                mode it's an absolute warm-start; in delta_mode it's a
+                delta warm-start (sampler perturbs deltas around it).
             return_iteration_log: when True, also return the per-iteration
-                reward/weight records captured during this plan step. Defaults
-                to False so older callers that expect only an action keep
-                working unchanged.
+                reward/weight records captured during this plan step.
+            anchor: required when delta_mode=True. Absolute current
+                action (in normalized [-1,+1]) from which sampled deltas
+                will be cumsum-integrated. Ignored in vanilla mode.
+
+        Returns the FIRST ABSOLUTE action (mode-agnostic). The full
+        absolute trajectory is on ``self.last_stats.act_seq``.
         """
+        delta_mode = bool(getattr(self.cfg, "delta_mode", False))
+        if delta_mode:
+            if anchor is None:
+                raise RuntimeError(
+                    "plan_step: delta_mode=True requires anchor=...; "
+                    "got anchor=None."
+                )
+            self.set_anchor(anchor)
+        # In vanilla mode anchor is ignored — silently, to keep the
+        # caller mode-agnostic.
+
         act_seq, stats = self.trajectory_optimization(z_current, goal_state, init_act_seq)
         action = act_seq[0]
         if return_iteration_log:
