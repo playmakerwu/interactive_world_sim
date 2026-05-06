@@ -38,7 +38,7 @@ if str(REPO_ROOT) not in sys.path:
 from env.pusht_wm_env import PushTWMEnv  # noqa: E402
 from rl.mppi import distributed as D  # noqa: E402
 from rl.mppi.mppi_planner import MPPIPlanner  # noqa: E402
-from scripts.run_config import STEP_EACH_ITER, USE_WARM_START  # noqa: E402
+from scripts.run_config import USE_WARM_START  # noqa: E402
 
 
 def _apply_cli_overrides(cfg, args) -> dict:
@@ -346,6 +346,7 @@ def _run_episode(
         print(f"\n[!! config deviation] {config_deviation}\n")
     if is_rank0:
         print(f"Effective config:\n{OmegaConf.to_yaml(cfg)}")
+        print(f"[step_each_iter] = {int(getattr(cfg, 'step_each_iter', 1))}")
         print(f"Loading WM from {args.wm_ckpt}")
     env = PushTWMEnv(
         args.wm_ckpt,
@@ -375,7 +376,7 @@ def _run_episode(
 
     # ── main control loop ──
     trajectory_latents: list[torch.Tensor] = [z.cpu().clone()]
-    converged_plans: list[torch.Tensor] = []   # (n_plan_calls, H, A); equals control_steps when STEP_EACH_ITER=1
+    converged_plans: list[torch.Tensor] = []   # (n_plan_calls, H, A); equals control_steps when step_each_iter=1
     iteration_logs: list[list[dict[str, Any]]] = []
     rgb_frames: list[np.ndarray] = []
     per_step: list[dict] = []
@@ -439,17 +440,18 @@ def _run_episode(
                 f"raw={raw_anchor.tolist()}  normalized={anchor_norm.tolist()}"
             )
 
+    step_each_iter = int(getattr(cfg, "step_each_iter", 1))
     t0_run = time.time()
     n_actions_done = 0
     while n_actions_done < int(cfg.control_steps):
         # Number of actions executed during this trajectory_optimization
-        # call. With the default STEP_EACH_ITER=1 this is always 1
-        # (bit-equivalent to the pre-refactor loop). With STEP_EACH_ITER=N
+        # call. With the default step_each_iter=1 this is always 1
+        # (bit-equivalent to the pre-refactor loop). With step_each_iter=N
         # the planner is called ceil(control_steps/N) times and N actions
         # are executed per call (matches reference exp_sim_control.py
         # lines 108, 151-155, 219-220). The final call may execute fewer
         # than N when control_steps % N != 0.
-        n_this = min(int(STEP_EACH_ITER), int(cfg.control_steps) - n_actions_done)
+        n_this = min(step_each_iter, int(cfg.control_steps) - n_actions_done)
 
         t0_plan = time.time()
         init_act = act_seq_running if USE_WARM_START else None
@@ -530,8 +532,8 @@ def _run_episode(
 
         if USE_WARM_START:
             # Shift-and-pad by n_this (the number of actions actually
-            # executed this call) — equals STEP_EACH_ITER except on a
-            # final partial call when control_steps % SEI != 0. In
+            # executed this call) — equals step_each_iter except on a
+            # final partial call when control_steps % step_each_iter != 0. In
             # delta-mode the running plan is itself a delta sequence;
             # pad with zeros (= "no further movement") instead of
             # repeating the last delta to avoid runaway accumulation.
@@ -564,10 +566,10 @@ def _run_episode(
     # ── save artifacts ──
     torch.save(torch.stack(trajectory_latents), out_dir / "trajectory_latents.pt")
     # action_history.pt schema: (n_plan_calls, H, A) -- the FULL converged
-    # plan from each MPPI call. With STEP_EACH_ITER=1 this equals
+    # plan from each MPPI call. With step_each_iter=1 this equals
     # control_steps and slice [:, 0, :] recovers the executed sequence.
-    # With STEP_EACH_ITER>1 the leading axis is ceil(control_steps/SEI)
-    # and slice [:, :SEI, :] (flattened) recovers the executed sequence
+    # With step_each_iter>1 the leading axis is ceil(control_steps/step_each_iter)
+    # and slice [:, :step_each_iter, :] (flattened) recovers the executed sequence
     # (modulo the final partial call). Bumped from (T, A) so downstream
     # debug/replay tools can inspect the entire planner output.
     torch.save(torch.stack(converged_plans), out_dir / "action_history.pt")

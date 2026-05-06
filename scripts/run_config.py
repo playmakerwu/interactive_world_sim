@@ -22,15 +22,7 @@ defaults to ``torch.zeros(H, A)``), producing the pre-fix behaviour for A/B
 comparison.
 """
 
-STEP_EACH_ITER: int = 1
-"""Number of actions executed between consecutive ``plan_step`` calls.
-
-The MPPI run loop in ``scripts/run_mppi_v2.py`` calls
-``planner.plan_step(...)`` once and then executes ``STEP_EACH_ITER``
-consecutive actions from the converged plan via ``env.dynamics_step``
-before re-planning. The warm-start shift-and-pad uses the same value
-(matches reference ``exp_sim_control.py:108, 151-155, 219-220``). The
-total number of executed actions in an episode is ``cfg.control_steps``
-regardless of this knob; with ``STEP_EACH_ITER=N`` the number of MPPI
-calls is ``ceil(control_steps / N)``.
-"""
+# STEP_EACH_ITER moved to yaml: configs/mppi/default.yaml field
+# step_each_iter (default 1). Read in run_mppi_v2.py via
+# int(getattr(cfg, "step_each_iter", 1)) for backward compat with
+# pre-refactor yamls that lack the field.

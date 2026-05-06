@@ -56,6 +56,16 @@ delta_action_lim: 0.0872          # symmetric per-dim p99 from demos
 noise_level_delta: 0.02           # ~25% of delta_action_lim, conservative
 cumulative_drift_log_only: true   # log ‖a_t − anchor_0‖ but don't clip
 
+# --- run-loop pacing ---
+# Number of actions executed per plan_step call. With step_each_iter=1
+# (default), the planner is called once per executed action; with N>1,
+# planner.plan_step is called once and N consecutive actions are executed
+# from the converged plan before re-planning. Total executed actions per
+# episode is always cfg.control_steps; number of MPPI calls is
+# ceil(control_steps / step_each_iter). Matches reference
+# exp_sim_control.py (lines 108, 151-155, 219-220).
+step_each_iter: 1
+
 # --- run control (consumed by scripts/run_mppi_v2.py, not by MPPIPlanner) ---
 control_steps: 50         # plan_step calls per episode
 seed: 0                   # planner sampler RNG seed (does not control WM
