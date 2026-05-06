@@ -99,41 +99,61 @@ def test_delta_mode_false_matches_prior_sampler():
 # ── 2. delta-mode clipping ──────────────────────────────────────────
 
 
-def test_delta_mode_clips_per_dim_to_delta_action_lim():
-    """In delta_mode, every sample component is in [-lim, +lim]."""
+def test_delta_mode_returns_absolutes_inside_cube():
+    """Post-refactor: delta_mode samples are ABSOLUTE actions in
+    [action_lower_lim, action_upper_lim] (the cube). Per-step delta clamp
+    + cumsum + cube clamp happen inside the planner; caller only sees
+    absolutes. Anchor near origin, deltas are small so output stays
+    comfortably inside the cube around the anchor."""
     lim = 0.0872
     cfg = _base_cfg(
         delta_mode=True, delta_action_lim=lim, noise_level_delta=0.02,
         n_sample=64, n_look_ahead=10,
     )
     planner = MPPIPlanner(_StubEnv(), cfg)
+    anchor = torch.zeros(4)  # safe anchor in middle of cube
+    planner.set_anchor(anchor)
     seed = torch.zeros(10, 4)
     out = planner.sample_action_sequences(seed)
     assert out.shape == (64, 10, 4)
-    assert (out >= -lim - 1e-6).all(), f"min {out.min().item()} below -lim={-lim}"
-    assert (out <=  lim + 1e-6).all(), f"max {out.max().item()} above +lim={+lim}"
+    # Absolute, in cube
+    assert (out >= -1.0 - 1e-6).all(), f"min {out.min().item()} below -1"
+    assert (out <=  1.0 + 1e-6).all(), f"max {out.max().item()} above +1"
+    # Anchor=0, sigma=0.02, max H=10 cumsum: per-trajectory stays near 0
+    # (worst-case per-step delta capped at 0.0872, max cumsum ≈ 0.872).
+    assert out.abs().max().item() < 1.0, (
+        f"with safe anchor and noise_level_delta=0.02 expected output far "
+        f"from cube edge; got max={out.abs().max().item()}"
+    )
 
 
-def test_delta_mode_clip_actually_fires_with_loud_noise():
-    """A noise level larger than delta_action_lim makes the clip actively
-    truncate samples — verify the bounds are saturated."""
+def test_delta_mode_anchor_near_edge_clamps_to_cube():
+    """Anchor near +1 edge with positive-pushed deltas: cumsum drifts
+    toward +1 and the planner's cube clamp must engage."""
     cfg = _base_cfg(
         delta_mode=True, delta_action_lim=0.05, noise_level_delta=0.20,
         beta_filter=1.0, n_sample=32, n_look_ahead=8,
     )
     planner = MPPIPlanner(_StubEnv(), cfg)
+    # Anchor near upper edge: cumsum of any positive deltas saturates fast
+    planner.set_anchor(torch.full((4,), 0.95))
     out = planner.sample_action_sequences(torch.zeros(8, 4))
-    # With sigma=0.20 and clip at 0.05, expect saturation (some entries == ±0.05).
-    saturated_max = (out.abs() >= 0.05 - 1e-6).any().item()
-    assert saturated_max, "expected clip to fire under sigma=0.20 / lim=0.05"
+    # Cube clamp must hold even with aggressive deltas
+    assert (out <= 1.0 + 1e-6).all(), f"max {out.max().item()} above +1"
+    assert (out >= -1.0 - 1e-6).all(), f"min {out.min().item()} below -1"
+    # And at least one sample saturates to +1 (cube clamp engaged)
+    assert (out >= 1.0 - 1e-6).any().item(), (
+        "expected cube clamp to engage with anchor=0.95 and loud +deltas"
+    )
 
 
 # ── 3. noise level routing ──────────────────────────────────────────
 
 
 def test_delta_mode_uses_noise_level_delta_not_noise_level():
-    """Setting noise_level=10.0 in delta_mode must not blow up samples; only
-    noise_level_delta governs the actual noise scale."""
+    """Setting noise_level=10.0 in delta_mode must not blow up samples;
+    noise_level_delta governs the per-step delta scale, and then the
+    cube clamp catches anything that drifts out."""
     cfg = _base_cfg(
         delta_mode=True,
         noise_level=10.0,         # absurdly large; should be IGNORED in delta mode
@@ -143,12 +163,15 @@ def test_delta_mode_uses_noise_level_delta_not_noise_level():
         n_sample=64, n_look_ahead=10,
     )
     planner = MPPIPlanner(_StubEnv(), cfg)
+    anchor = torch.tensor([0.10, -0.20, 0.30, -0.40])
+    planner.set_anchor(anchor)
     out = planner.sample_action_sequences(torch.zeros(10, 4))
-    # With sigma=0.001 and beta=0, per-step residual std ≈ 0.001; samples
-    # should be tiny — well under the clip bound.
-    assert out.abs().max().item() < 0.01, (
-        f"expected tiny samples under noise_level_delta=0.001; got max="
-        f"{out.abs().max().item()}"
+    # With sigma=0.001 over H=10 steps, max cumsum drift ≈ 0.01.
+    # Output should stay within ~0.02 of anchor per dim.
+    drift = (out - anchor.view(1, 1, -1)).abs().max().item()
+    assert drift < 0.05, (
+        f"expected tiny drift under noise_level_delta=0.001; got max="
+        f"{drift}"
     )
 
 
@@ -234,13 +257,46 @@ def test_anchor_frame_idx_zero_uses_frame_zero():
 # ── 6. waypoint sampler also respects delta_mode ────────────────────
 
 
-def test_delta_mode_waypoint_sampler_clips():
-    """When waypoints_n is set, the same delta_mode clip applies after interp."""
+def test_delta_mode_waypoint_sampler_returns_absolutes_in_cube():
+    """When waypoints_n is set, delta_mode integration + cube clamp still
+    apply after interpolation. Output is absolute, in cube."""
     cfg = _base_cfg(
         delta_mode=True, delta_action_lim=0.0872, noise_level_delta=0.10,
         beta_filter=1.0, waypoints_n=3, n_look_ahead=10, n_sample=16,
     )
     planner = MPPIPlanner(_StubEnv(), cfg)
+    planner.set_anchor(torch.zeros(4))
     out = planner.sample_action_sequences(torch.zeros(10, 4))
     assert out.shape == (16, 10, 4)
-    assert (out.abs() <= 0.0872 + 1e-6).all()
+    assert (out <= 1.0 + 1e-6).all()
+    assert (out >= -1.0 - 1e-6).all()
+
+
+def test_delta_mode_raises_without_anchor():
+    """Calling sample_action_sequences in delta_mode without setting
+    anchor must raise a clear error (defensive contract check)."""
+    cfg = _base_cfg(delta_mode=True, n_sample=4, n_look_ahead=5)
+    planner = MPPIPlanner(_StubEnv(), cfg)
+    # Note: anchor not set
+    import pytest as _pytest
+    with _pytest.raises(RuntimeError, match="set_anchor"):
+        planner.sample_action_sequences(torch.zeros(5, 4))
+
+
+def test_planner_returns_absolutes_in_both_modes():
+    """The planner's sample_action_sequences contract: returns absolute
+    action sequences in [-1, +1] regardless of delta_mode flag.
+    Vanilla mode has always done this; delta_mode now does too."""
+    # Vanilla
+    cfg_v = _base_cfg(delta_mode=False, n_sample=8, n_look_ahead=5)
+    p_v = MPPIPlanner(_StubEnv(), cfg_v)
+    out_v = p_v.sample_action_sequences(torch.zeros(5, 4))
+    assert (out_v >= -1.0 - 1e-6).all() and (out_v <= 1.0 + 1e-6).all()
+    # Delta
+    cfg_d = _base_cfg(delta_mode=True, n_sample=8, n_look_ahead=5)
+    p_d = MPPIPlanner(_StubEnv(), cfg_d)
+    p_d.set_anchor(torch.zeros(4))
+    out_d = p_d.sample_action_sequences(torch.zeros(5, 4))
+    assert (out_d >= -1.0 - 1e-6).all() and (out_d <= 1.0 + 1e-6).all()
+    # Same shape
+    assert out_v.shape == out_d.shape

@@ -101,18 +101,19 @@ def test_step_each_iter_partial_final_call():
 def test_step_each_iter_does_not_break_delta_mode():
     """delta_mode=true + step_each_iter=5 must construct cleanly; the two
     features are orthogonal (delta_mode lives in the sampler, step_each_iter
-    in the run loop)."""
+    in the run loop). Post-refactor, sampler returns absolutes in cube."""
     cfg = _base_cfg(
         delta_mode=True, step_each_iter=5,
         delta_action_lim=0.0872, noise_level_delta=0.02,
         n_sample=8, n_look_ahead=10,
     )
     planner = MPPIPlanner(_StubEnv(), cfg)
+    planner.set_anchor(torch.zeros(4))
     seed = torch.zeros(10, 4)
     out = planner.sample_action_sequences(seed)
     assert out.shape == (8, 10, 4)
-    # delta_mode clip should still apply
-    assert (out.abs() <= 0.0872 + 1e-6).all()
+    # Absolute, in cube (post-refactor contract)
+    assert (out <= 1.0 + 1e-6).all() and (out >= -1.0 - 1e-6).all()
 
 
 def test_step_each_iter_missing_field_falls_back_to_1():
