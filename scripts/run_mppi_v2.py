@@ -418,10 +418,14 @@ def _run_episode(
     # outputs/diagnostics/demo_action_stats_*.md for empirical bounds and
     # outputs/diagnostics/clip_logic_audit_*.md for design rationale.
     delta_mode = bool(getattr(cfg, "delta_mode", False))
+    sample_delta_clip = bool(getattr(cfg, "sample_delta_clip", False))
+    # Anchor is needed when EITHER delta_mode OR (vanilla + sample_delta_clip)
+    # is on; both consume planner.set_anchor() / plan_step(anchor=...).
+    needs_anchor = delta_mode or sample_delta_clip
     cumulative_drift_log: list[float] = []
     anchor_norm: torch.Tensor | None = None
     anchor_initial: torch.Tensor | None = None
-    if delta_mode:
+    if needs_anchor:
         # Read raw action at frame_idx-1 (the action that took us into
         # the initial state; or frame 0 at episode start). Apply the WM's
         # training-time normalizer to land in the same space MPPI samples
@@ -436,8 +440,9 @@ def _run_episode(
         ).squeeze(0).to(device=env.device, dtype=torch.float32)
         anchor_initial = anchor_norm.clone()
         if is_rank0:
+            tag = "delta_mode" if delta_mode else "sample_delta_clip"
             print(
-                f"[delta_mode] anchor from frame {anchor_frame}: "
+                f"[{tag}] anchor from frame {anchor_frame}: "
                 f"raw={raw_anchor.tolist()}  normalized={anchor_norm.tolist()}"
             )
 
@@ -544,10 +549,12 @@ def _run_episode(
                     [converged_dev[n_this:], new_tail], dim=0
                 )
 
-        if delta_mode:
+        if needs_anchor:
             # Advance anchor to the last absolute action we just executed
-            # (already in the cube — the planner's clamp ran). Subsequent
-            # plan calls will integrate sampled deltas from this point.
+            # (already in the cube — the planner's clamp ran). For
+            # delta_mode subsequent plans cumsum-integrate from here; for
+            # vanilla+sample_delta_clip subsequent plans bound their
+            # first-step delta against this point.
             anchor_norm = converged[n_this - 1].to(env.device).detach().clone()
 
         n_actions_done += n_this

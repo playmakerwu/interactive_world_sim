@@ -56,6 +56,25 @@ delta_action_lim: 0.0872          # symmetric per-dim p99 from demos
 noise_level_delta: 0.02           # ~25% of delta_action_lim, conservative
 cumulative_drift_log_only: true   # log ‖a_t − anchor_0‖ but don't clip
 
+# --- vanilla-mode sample-side per-step delta clip (NEW) ---
+# When sample_delta_clip=true (vanilla mode only), every sampled
+# trajectory has its per-step deltas clipped to ±per_step_delta_lim
+# before the WM rollout. The first step's delta is bounded relative
+# to the previous executed action (anchor); subsequent steps are
+# bounded relative to the previous in-trajectory step. Cube clip
+# [-1, +1] is retained as outer safety. Mutually exclusive with
+# delta_mode (delta_mode already bounds per-step deltas via cumsum;
+# enabling both raises a warning and disables sample_delta_clip).
+# Niter-audit motivation (outputs/diagnostics/niter_evolution_audit_*):
+# vanilla MPPI mean drifted >4× demo p99 within 50 niters without this
+# constraint; sample-side clip prevents the WM from ever scoring
+# per-step deltas outside the demo distribution.
+sample_delta_clip: false          # off by default (backward compat)
+per_step_delta_lim: null          # 4-vector per-dim normalized bound;
+                                  # null ⇒ use audit-derived demo p99
+                                  # [0.0975, 0.0919, 0.0760, 0.0909]
+                                  # (mini dataset, 1989 transitions).
+
 # --- run-loop pacing ---
 # Number of actions executed per plan_step call. With step_each_iter=1
 # (default), the planner is called once per executed action; with N>1,
