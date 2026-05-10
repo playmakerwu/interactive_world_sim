@@ -113,6 +113,18 @@ class MPPIPlanner:
                 lim_list, dtype=torch.float32, device=self.device,
             )
 
+        # Audit log (yaml-gated; see ``audit_log_enabled`` in default.yaml).
+        # Always allocated; only written when ``audit_log_enabled=True``.
+        # ``_audit_plan_call_idx`` is bumped at the top of each
+        # ``trajectory_optimization`` call so entries can be grouped per
+        # plan_step downstream.
+        self._audit_log: list[dict[str, Any]] = []
+        self._audit_plan_call_idx: int = -1
+
+    def get_audit_log(self) -> list[dict[str, Any]]:
+        """Return the accumulated audit log (empty when feature disabled)."""
+        return self._audit_log
+
     def set_anchor(self, anchor: torch.Tensor) -> None:
         """Set the absolute-action anchor.
 
@@ -564,6 +576,19 @@ class MPPIPlanner:
         last_act_seqs: torch.Tensor | None = None
         last_rewards_full: torch.Tensor | None = None  # GPU copy for re-roll
 
+        audit_enabled = bool(getattr(self.cfg, "audit_log_enabled", False))
+        audit_record_samples = bool(
+            getattr(self.cfg, "audit_log_record_samples", False)
+        )
+        if audit_enabled and r == 0:
+            self._audit_plan_call_idx += 1
+            self._audit_log.append({
+                "plan_call_idx": int(self._audit_plan_call_idx),
+                "niter": -1,
+                "mean": act_seq.detach().cpu().float().numpy().tolist(),
+                "best_sample_reward": None,
+            })
+
         for iter_idx in range(int(self.cfg.n_update_iter)):
             # ── 1. Sample (rank 0 only) + broadcast ──────────────────
             # Numerical-equivalence guarantee with single-GPU runs at the
@@ -611,6 +636,21 @@ class MPPIPlanner:
                 iteration_log.append(
                     self._build_iteration_record(iter_idx, rewards, weights, state=state)
                 )
+                if audit_enabled:
+                    entry: dict[str, Any] = {
+                        "plan_call_idx": int(self._audit_plan_call_idx),
+                        "niter": int(iter_idx),
+                        "mean": act_seq.detach().cpu().float().numpy().tolist(),
+                        "best_sample_reward": float(rewards.max().item()),
+                    }
+                    if audit_record_samples:
+                        entry["samples"] = (
+                            act_seqs.detach().cpu().float().numpy().tolist()
+                        )
+                        entry["sample_rewards"] = (
+                            rewards.detach().cpu().float().numpy().tolist()
+                        )
+                    self._audit_log.append(entry)
 
         # After the optimization loop, re-roll the top-K trajectories from
         # the last iteration and CV-label every step along the rollout, so

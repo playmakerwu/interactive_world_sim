@@ -75,6 +75,23 @@ per_step_delta_lim: null          # 4-vector per-dim normalized bound;
                                   # [0.0975, 0.0919, 0.0760, 0.0909]
                                   # (mini dataset, 1989 transitions).
 
+# --- audit logging (NEW) ---
+# Persistent per-niter audit of MPPI's optimization trace, dumped as JSON
+# at end of run. Replaces ad-hoc instrumentation patterns previously used
+# for niter-evolution videos and post-hoc OOD analysis. Zero overhead
+# when disabled. When ``audit_log_enabled=true`` the runner writes
+# ``audit_log.json`` next to the other artifacts (or to
+# ``audit_log_path`` if explicitly set). Each entry: ``plan_call_idx``,
+# ``niter`` (-1 for the pre-loop init snapshot, 0..n_update_iter-1
+# inside the loop), ``mean`` (H, A), ``best_sample_reward``. With
+# ``audit_log_record_samples=true`` each in-loop entry additionally
+# carries ``samples`` (N, H, A) and ``sample_rewards`` (N,) — heavier
+# but lets downstream tools plot top-K trajectories, sample-spread
+# diagnostics, etc.
+audit_log_enabled: false
+audit_log_record_samples: false
+audit_log_path: null              # null ⇒ <output_dir>/audit_log.json
+
 # --- run-loop pacing ---
 # Number of actions executed per plan_step call. With step_each_iter=1
 # (default), the planner is called once per executed action; with N>1,

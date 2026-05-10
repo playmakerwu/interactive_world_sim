@@ -741,6 +741,18 @@ def _run_episode(
         cloud_script.chmod(0o755)
         print(f"  reproduction script: {cloud_script}")
 
+    if bool(getattr(cfg, "audit_log_enabled", False)):
+        audit_log = planner.get_audit_log()
+        audit_path_cfg = getattr(cfg, "audit_log_path", None)
+        audit_out = (
+            Path(audit_path_cfg) if audit_path_cfg
+            else out_dir / "audit_log.json"
+        )
+        audit_out.parent.mkdir(parents=True, exist_ok=True)
+        with open(audit_out, "w") as af:
+            json.dump(audit_log, af)
+        print(f"  audit log: {audit_out} ({len(audit_log)} entries)")
+
     print(f"\nWrote artifacts to {out_dir}")
     print(f"  final_pos_distance_px      = {final_pos}")
     print(f"  final_angle_error_deg      = {final_ang_err}")
