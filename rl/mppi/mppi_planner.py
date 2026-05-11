@@ -172,6 +172,16 @@ class MPPIPlanner:
             "best_sample_idx": np.int32(rewards.argmax().item()),
             "best_sample_reward": np.float32(rewards.max().item()),
         }
+        # H-axis convention (per env/pusht_wm_env.py:179
+        # ``PushTWMEnv.rollout`` contract): the saved array has shape
+        # ``(N, H+1, C, H_lat, W_lat)``. Index ``[:, 0]`` is ``z_current``
+        # (the planner's input latent to evaluate_trajectories, broadcast
+        # across all N samples — so all N start latents are bit-identical
+        # for a given niter); index ``[:, t]`` for ``1 ≤ t ≤ H`` is the
+        # WM latent after applying the first ``t`` actions of each
+        # sample's trajectory. Empirically verified: cos(lat[:, 0],
+        # z_current) = 1.0; lat[i, 0] == lat[j, 0] for all i, j;
+        # lat[i, t] ≠ lat[j, t] for t ≥ 1.
         if (self._debug_last_rollout is not None
                 and bool(getattr(self.cfg, "debug_dump_per_sample_rollout", False))):
             payload["per_sample_rollout_latents"] = (
