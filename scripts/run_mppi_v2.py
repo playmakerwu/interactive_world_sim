@@ -113,6 +113,172 @@ def _apply_cli_overrides(cfg, args) -> dict:
     return config_deviation
 
 
+def _debug_dump_init(
+    debug_dir: Path,
+    cfg: Any,
+    args: argparse.Namespace,
+    env: "PushTWMEnv",
+    z0: torch.Tensor,
+    goal: dict,
+) -> None:
+    """Write the run-start debug artifacts: environment / seeds / config /
+    init_state / wm_ckpt_meta."""
+    import hashlib
+    import platform
+    import subprocess
+
+    # environment.json
+    env_info: dict[str, Any] = {
+        "timestamp_iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "python_version": platform.python_version(),
+        "platform": platform.platform(),
+        "torch_version": torch.__version__,
+        "numpy_version": np.__version__,
+        "cuda_available": torch.cuda.is_available(),
+    }
+    if torch.cuda.is_available():
+        env_info["cuda_version"] = torch.version.cuda
+        env_info["gpu_name"] = torch.cuda.get_device_name(0)
+        env_info["cudnn_version"] = torch.backends.cudnn.version()
+        env_info["cudnn_deterministic"] = bool(torch.backends.cudnn.deterministic)
+        env_info["cudnn_benchmark"] = bool(torch.backends.cudnn.benchmark)
+        env_info["n_visible_gpus"] = torch.cuda.device_count()
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=str(REPO_ROOT),
+        ).decode().strip()
+        env_info["git_sha"] = sha
+    except Exception as e:
+        env_info["git_sha"] = f"unavailable: {e}"
+    try:
+        diff = subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=str(REPO_ROOT),
+        ).decode().strip()
+        env_info["git_dirty"] = bool(diff)
+    except Exception:
+        env_info["git_dirty"] = None
+    with open(debug_dir / "environment.json", "w") as f:
+        json.dump(env_info, f, indent=2)
+
+    # seeds.json — initial RNG states at run start. Hex-encoded raw bytes.
+    seeds: dict[str, Any] = {
+        "cfg_seed": int(getattr(cfg, "seed", 0)),
+        "torch_initial_seed": torch.initial_seed(),
+        "torch_rng_state_cpu_hex": torch.get_rng_state().numpy().tobytes().hex(),
+        "numpy_rng_state_repr": str(np.random.get_state()),
+    }
+    if torch.cuda.is_available():
+        try:
+            seeds["torch_cuda_rng_state_hex"] = (
+                torch.cuda.get_rng_state(env.device).numpy().tobytes().hex()
+            )
+        except Exception as e:
+            seeds["torch_cuda_rng_state_hex"] = f"unavailable: {e}"
+    with open(debug_dir / "seeds.json", "w") as f:
+        json.dump(seeds, f, indent=2)
+
+    # resolved_config.yaml — fully resolved OmegaConf
+    with open(debug_dir / "resolved_config.yaml", "w") as f:
+        f.write(OmegaConf.to_yaml(cfg, resolve=True))
+
+    # wm_ckpt_meta.json
+    ckpt_path = Path(args.wm_ckpt)
+    md5 = hashlib.md5()
+    try:
+        with open(ckpt_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
+                md5.update(chunk)
+        ckpt_meta = {
+            "path": str(ckpt_path),
+            "size_bytes": ckpt_path.stat().st_size,
+            "md5": md5.hexdigest(),
+        }
+    except Exception as e:
+        ckpt_meta = {"path": str(ckpt_path), "error": str(e)}
+    with open(debug_dir / "wm_ckpt_meta.json", "w") as f:
+        json.dump(ckpt_meta, f, indent=2)
+
+    # init_state.npz — z0 + decoded init RGB + goal
+    rgb0 = env.decode(z0)
+    rgb0_u8 = (rgb0.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8).transpose(1, 2, 0)
+    payload: dict[str, Any] = {
+        "z0_latent": z0.detach().cpu().float().numpy(),
+        "init_rgb": rgb0_u8,
+        "goal_cx": np.float32(goal.get("cx", 0.0)),
+        "goal_cy": np.float32(goal.get("cy", 0.0)),
+        "goal_theta_deg": np.float32(goal.get("theta_deg", 0.0)),
+        "initial_frame": np.int32(args.initial_frame),
+        "initial_hdf5": np.array(str(args.initial_hdf5)),
+    }
+    tmp = debug_dir / ".init_state.partial.npz"
+    np.savez(tmp, **payload)
+    tmp.replace(debug_dir / "init_state.npz")
+
+
+def _debug_dump_executed_step(
+    plan_dir: Path,
+    executed_actions: np.ndarray,
+    z_before: np.ndarray | None,
+    z_after: np.ndarray,
+    rgb_before: np.ndarray | None,
+    rgb_after: np.ndarray | None,
+    state_before: dict | None,
+    state_after: dict | None,
+    plan_wall_s: float,
+    converged_full: np.ndarray,
+) -> None:
+    """Dump per-plan-call executed action + frames + CV pose before/after."""
+    def _state_to_arr(s: dict | None) -> np.ndarray:
+        if s is None or not s.get("cv_success"):
+            return np.array([np.nan, np.nan, np.nan], dtype=np.float32)
+        return np.array(
+            [s.get("cx") or np.nan, s.get("cy") or np.nan,
+             s.get("theta_deg") or np.nan], dtype=np.float32,
+        )
+
+    payload: dict[str, Any] = {
+        "executed_actions": executed_actions.astype(np.float32),
+        "converged_full_plan": converged_full.astype(np.float32),
+        "z_after": z_after.astype(np.float32),
+        "cv_pose_before_cxcy_theta": _state_to_arr(state_before),
+        "cv_pose_after_cxcy_theta": _state_to_arr(state_after),
+        "plan_wall_s": np.float32(plan_wall_s),
+        "reward_after": np.float32(
+            state_after.get("reward", float("nan"))
+            if state_after else float("nan"),
+        ),
+    }
+    if z_before is not None:
+        payload["z_before"] = z_before.astype(np.float32)
+    if rgb_before is not None:
+        payload["rgb_before"] = np.asarray(rgb_before, dtype=np.uint8)
+    if rgb_after is not None:
+        payload["rgb_after"] = np.asarray(rgb_after, dtype=np.uint8)
+    out = plan_dir / "executed_step.npz"
+    tmp = plan_dir / ".executed_step.partial.npz"
+    np.savez(tmp, **payload)
+    tmp.replace(out)
+
+
+def _debug_dump_manifest(debug_dir: Path) -> None:
+    """Walk the debug dir and write manifest.json listing every file +
+    size + total."""
+    files = []
+    total = 0
+    for p in sorted(debug_dir.rglob("*")):
+        if p.is_file() and p.name != "manifest.json":
+            sz = p.stat().st_size
+            files.append({
+                "path": str(p.relative_to(debug_dir)),
+                "size_bytes": sz,
+            })
+            total += sz
+    manifest = {"total_bytes": total, "total_mb": round(total / (1024 ** 2), 2),
+                "n_files": len(files), "files": files}
+    with open(debug_dir / "manifest.json", "w") as f:
+        json.dump(manifest, f, indent=2)
+
+
 def _write_mp4(frames: list[np.ndarray], out_path: Path, fps: int = 8) -> None:
     if not frames:
         return
@@ -374,6 +540,21 @@ def _run_episode(
 
     planner = MPPIPlanner(env, cfg)
 
+    # ── debug_mode initial dumps (rank 0 only) ──
+    # See ``configs/mppi/default.yaml`` docstring for layout.
+    debug_mode = bool(getattr(cfg, "debug_mode", False))
+    debug_dir: Path | None = None
+    if debug_mode and is_rank0:
+        debug_path_cfg = getattr(cfg, "debug_dump_dir", None)
+        debug_dir = (Path(debug_path_cfg) if debug_path_cfg
+                     else out_dir / "debug")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        planner.set_debug_dir(debug_dir)
+        _debug_dump_init(
+            debug_dir=debug_dir, cfg=cfg, args=args, env=env,
+            z0=z, goal=goal,
+        )
+
     # ── main control loop ──
     trajectory_latents: list[torch.Tensor] = [z.cpu().clone()]
     converged_plans: list[torch.Tensor] = []   # (n_plan_calls, H, A); equals control_steps when step_each_iter=1
@@ -459,6 +640,12 @@ def _run_episode(
         # than N when control_steps % N != 0.
         n_this = min(step_each_iter, int(cfg.control_steps) - n_actions_done)
 
+        # Snapshot pre-plan state for debug_mode (rank 0 only). The
+        # post-plan snapshot happens after the sub-step loop ends.
+        debug_z_before = z.detach().cpu().clone() if (debug_mode and is_rank0) else None
+        debug_rgb_before = rgb_frames[-1] if (debug_mode and is_rank0 and rgb_frames) else None
+        debug_state_before = per_step[-1] if (debug_mode and is_rank0 and per_step) else None
+
         t0_plan = time.time()
         init_act = act_seq_running if USE_WARM_START else None
         a, iter_log = planner.plan_step(
@@ -530,6 +717,25 @@ def _run_episode(
             # One converged plan + one iter_log per plan_step call.
             converged_plans.append(converged)
             iteration_logs.append(iter_log)
+
+        # Per-plan executed_step.npz for debug_mode (rank 0 only).
+        if debug_mode and is_rank0 and debug_dir is not None:
+            plan_idx = int(planner._audit_plan_call_idx)
+            plan_dir = debug_dir / f"plan_{plan_idx:03d}"
+            plan_dir.mkdir(parents=True, exist_ok=True)
+            _debug_dump_executed_step(
+                plan_dir=plan_dir,
+                executed_actions=converged[:n_this].detach().cpu().numpy(),
+                z_before=(debug_z_before.numpy()
+                          if debug_z_before is not None else None),
+                z_after=z.detach().cpu().numpy(),
+                rgb_before=debug_rgb_before,
+                rgb_after=rgb_frames[-1] if rgb_frames else None,
+                state_before=debug_state_before,
+                state_after=per_step[-1] if per_step else None,
+                plan_wall_s=plan_wall,
+                converged_full=converged.detach().cpu().numpy(),
+            )
 
         if USE_WARM_START:
             # Shift-and-pad by n_this. In delta_mode the warm-start
@@ -741,7 +947,13 @@ def _run_episode(
         cloud_script.chmod(0o755)
         print(f"  reproduction script: {cloud_script}")
 
-    if bool(getattr(cfg, "audit_log_enabled", False)):
+    if debug_mode and debug_dir is not None:
+        _debug_dump_manifest(debug_dir)
+        manifest = json.load(open(debug_dir / "manifest.json"))
+        print(f"  debug dump: {debug_dir} ({manifest['total_mb']} MB, "
+              f"{manifest['n_files']} files)")
+
+    if bool(getattr(cfg, "audit_log_enabled", False)) or debug_mode:
         audit_log = planner.get_audit_log()
         audit_path_cfg = getattr(cfg, "audit_log_path", None)
         audit_out = (

@@ -92,6 +92,48 @@ audit_log_enabled: false
 audit_log_record_samples: false
 audit_log_path: null              # null ⇒ <output_dir>/audit_log.json
 
+# --- debug mode (NEW) ---
+# Comprehensive paper-grade dumps for OOD investigation + cloud-vs-laptop
+# nondeterminism debugging. When ``debug_mode=true`` the runner creates
+# ``<output_dir>/debug/`` (or ``debug_dump_dir``) and dumps a per-run
+# manifest:
+#
+#   debug/
+#     environment.json          CUDA / torch versions, GPU model, attention
+#                               kernel, cudnn flags, git SHA, timestamp
+#     seeds.json                Initial RNG state (torch CPU + CUDA + numpy
+#                               + planner self._gen), hex-encoded
+#     resolved_config.yaml      Fully resolved OmegaConf (defaults expanded)
+#     wm_ckpt_meta.json         WM checkpoint path + MD5 + size
+#     init_state.npz            z0 latent, decoded init RGB, goal state
+#     plan_{k:03d}/
+#       executed_step.npz       Executed action, frames + latents before/after,
+#                               CV pose before/after, reward
+#       niter_{n:02d}.npz       Samples (N,H,A), sample_rewards (N,),
+#                               softmax_weights (N,), mean (H,A),
+#                               best_sample_{idx,reward}.
+#                               If debug_dump_per_sample_rollout: + per-sample
+#                               rollout latents (N, H+1, C, H_lat, W_lat).
+#                               If debug_dump_per_h_cv: + mean-rollout CV pose
+#                               per H step.
+#     manifest.json             List of all dumped files + total size
+#
+# Storage estimate at N=60 H=20 niter=30 T=50:
+#   - Tier 1 (default): ~250 MB
+#   - + per_sample_rollout: ~3 GB additional
+#   - + per_h_cv: negligible storage; +~12 min WM/CV time
+#   - + decoded_full (Tier 2): ~70 GB additional
+#
+# When debug_mode=true the audit_log_* settings are auto-promoted to
+# true regardless of their explicit values so audit_log.json is also
+# written (coarse summary alongside the granular debug dump).
+debug_mode: false
+debug_dump_dir: null              # null ⇒ <output_dir>/debug/
+debug_dump_per_sample_rollout: false   # save all-N rollout latents per niter
+debug_dump_per_h_cv: false        # decode + CV mean rollout per H step per niter
+debug_dump_decoded_full: false    # Tier 2: all-sample H-step RGB (~70 GB)
+debug_storage_warning_gb: 100     # warn (but don't block) if estimate > X
+
 # --- run-loop pacing ---
 # Number of actions executed per plan_step call. With step_each_iter=1
 # (default), the planner is called once per executed action; with N>1,

@@ -30,8 +30,10 @@ consistency comparison and will be deprecated after that.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from omegaconf import DictConfig
@@ -114,16 +116,105 @@ class MPPIPlanner:
             )
 
         # Audit log (yaml-gated; see ``audit_log_enabled`` in default.yaml).
-        # Always allocated; only written when ``audit_log_enabled=True``.
+        # Always allocated; only written when ``audit_log_enabled=True`` (or
+        # ``debug_mode=True``, which force-promotes audit_log behavior).
         # ``_audit_plan_call_idx`` is bumped at the top of each
         # ``trajectory_optimization`` call so entries can be grouped per
         # plan_step downstream.
         self._audit_log: list[dict[str, Any]] = []
         self._audit_plan_call_idx: int = -1
 
+        # Debug mode (yaml-gated; see ``debug_mode`` in default.yaml).
+        # When the runner sets ``set_debug_dir(...)`` the planner writes
+        # per-niter ``.npz`` files there. Independent of audit_log.json:
+        # the audit log is a coarse summary, debug/ is granular dumps.
+        self._debug_dir: Path | None = None
+        # Stash of the most recent per-sample rollout (set inside
+        # ``evaluate_trajectories`` when ``debug_dump_per_sample_rollout``
+        # is True; cleared otherwise). The niter loop reads this to write
+        # the per-sample rollout npz, then clears it.
+        self._debug_last_rollout: torch.Tensor | None = None
+        # Stash of z_current for the active plan so the niter loop can
+        # do the optional per-H WM rollout of the mean trajectory.
+        self._debug_z_current: torch.Tensor | None = None
+
     def get_audit_log(self) -> list[dict[str, Any]]:
         """Return the accumulated audit log (empty when feature disabled)."""
         return self._audit_log
+
+    def set_debug_dir(self, debug_dir: "Path | str | None") -> None:
+        """Tell the planner where to write per-niter debug ``.npz`` files.
+
+        ``None`` disables debug-file writing even if ``cfg.debug_mode=True``;
+        the audit log is unaffected.
+        """
+        if debug_dir is None:
+            self._debug_dir = None
+        else:
+            self._debug_dir = Path(debug_dir)
+
+    def _dump_debug_niter(
+        self,
+        plan_dir: Path,
+        iter_idx: int,
+        act_seqs: torch.Tensor,    # (N, H, A)
+        rewards: torch.Tensor,     # (N,)
+        weights: torch.Tensor,     # (N,)
+        mean: torch.Tensor,        # (H, A)
+    ) -> None:
+        """Dump the per-niter debug ``.npz`` (rank-0 only, called from
+        ``trajectory_optimization``)."""
+        payload: dict[str, np.ndarray] = {
+            "samples": act_seqs.detach().cpu().float().numpy(),
+            "sample_rewards": rewards.detach().cpu().float().numpy(),
+            "softmax_weights": weights.detach().cpu().float().numpy(),
+            "mean": mean.detach().cpu().float().numpy(),
+            "best_sample_idx": np.int32(rewards.argmax().item()),
+            "best_sample_reward": np.float32(rewards.max().item()),
+        }
+        if (self._debug_last_rollout is not None
+                and bool(getattr(self.cfg, "debug_dump_per_sample_rollout", False))):
+            payload["per_sample_rollout_latents"] = (
+                self._debug_last_rollout.float().numpy()
+            )
+        # Clear the stash (saved or not) so a stale rollout from a prior
+        # niter never leaks into a later dump.
+        self._debug_last_rollout = None
+
+        if bool(getattr(self.cfg, "debug_dump_per_h_cv", False)):
+            mean_traj = self._debug_rollout_mean_cv(mean)
+            if mean_traj is not None:
+                payload["mean_cv_per_h"] = mean_traj
+        # Write atomically. np.savez auto-appends .npz to paths missing it,
+        # so the temp path must already end in .npz or savez will write
+        # to a doubly-suffixed file. Pattern: ``.<name>.partial.npz`` →
+        # rename to ``<name>.npz``.
+        out_path = plan_dir / f"niter_{iter_idx:02d}.npz"
+        tmp_path = plan_dir / f".niter_{iter_idx:02d}.partial.npz"
+        np.savez(tmp_path, **payload)
+        tmp_path.replace(out_path)
+
+    def _debug_rollout_mean_cv(self, mean: torch.Tensor) -> np.ndarray | None:
+        """Roll out ``mean`` (H, A) through the WM from the stashed
+        ``self._debug_z_current`` and run CV on each of the H+1 decoded
+        frames. Returns an array of shape ``(H+1, 5)`` with columns
+        ``cx, cy, theta_deg, success, icp_residual``. None if no
+        z_current is stashed (shouldn't happen during a normal plan call)."""
+        if self._debug_z_current is None:
+            return None
+        with torch.no_grad():
+            traj = self.env.rollout(
+                self._debug_z_current.unsqueeze(0),
+                mean.unsqueeze(0).to(self.device),
+            )  # (1, H+1, C, h, w)
+            traj = traj.squeeze(0)
+        state = self._estimate_final_states(traj)
+        cx = state["cx"].cpu().numpy()
+        cy = state["cy"].cpu().numpy()
+        th = state["theta_deg"].cpu().numpy()
+        succ = state["success"].cpu().numpy().astype(np.float32)
+        icp = state["icp_residual"].cpu().numpy()
+        return np.stack([cx, cy, th, succ, icp], axis=1)
 
     def set_anchor(self, anchor: torch.Tensor) -> None:
         """Set the absolute-action anchor.
@@ -446,6 +537,14 @@ class MPPIPlanner:
         with torch.no_grad():
             traj = self.env.rollout(z0_batch, act_seqs)  # (N, H+1, C, h, w)
         z_final = traj[:, -1]  # (N, C, h, w)
+        # Stash the full per-sample rollout for the debug npz dump
+        # before freeing GPU memory. Only when the flag is set (the
+        # tensor is ~20 MB at production N=60,H=20 so we don't pay this
+        # cost by default). The niter loop reads this and clears it.
+        if bool(getattr(self.cfg, "debug_dump_per_sample_rollout", False)):
+            self._debug_last_rollout = traj.detach().cpu().clone()
+        else:
+            self._debug_last_rollout = None
         # Free the rollout-time scratch before decode (Step 3 finding from
         # the prior project — decode attention needs ~4 GiB scratch).
         del traj
@@ -576,10 +675,18 @@ class MPPIPlanner:
         last_act_seqs: torch.Tensor | None = None
         last_rewards_full: torch.Tensor | None = None  # GPU copy for re-roll
 
-        audit_enabled = bool(getattr(self.cfg, "audit_log_enabled", False))
-        audit_record_samples = bool(
-            getattr(self.cfg, "audit_log_record_samples", False)
+        debug_mode = bool(getattr(self.cfg, "debug_mode", False))
+        debug_dir_active = debug_mode and self._debug_dir is not None and r == 0
+        # debug_mode auto-promotes the audit_log flags so the run also
+        # produces audit_log.json (coarse summary alongside debug/).
+        audit_enabled = (
+            bool(getattr(self.cfg, "audit_log_enabled", False)) or debug_mode
         )
+        audit_record_samples = (
+            bool(getattr(self.cfg, "audit_log_record_samples", False))
+            or debug_mode
+        )
+        self._debug_z_current = z_current  # used by per-H CV path below
         if audit_enabled and r == 0:
             self._audit_plan_call_idx += 1
             self._audit_log.append({
@@ -588,6 +695,9 @@ class MPPIPlanner:
                 "mean": act_seq.detach().cpu().float().numpy().tolist(),
                 "best_sample_reward": None,
             })
+        if debug_dir_active:
+            plan_dir = self._debug_dir / f"plan_{self._audit_plan_call_idx:03d}"
+            plan_dir.mkdir(parents=True, exist_ok=True)
 
         for iter_idx in range(int(self.cfg.n_update_iter)):
             # ── 1. Sample (rank 0 only) + broadcast ──────────────────
@@ -650,7 +760,26 @@ class MPPIPlanner:
                         entry["sample_rewards"] = (
                             rewards.detach().cpu().float().numpy().tolist()
                         )
+                    if debug_mode:
+                        # Softmax weights are useful for understanding how
+                        # MPPI's softmax temperature distributed weight
+                        # across the N samples; not in the audit_log entry
+                        # by default (extra ~N floats/niter).
+                        entry["softmax_weights"] = (
+                            weights.detach().cpu().float().numpy().tolist()
+                        )
+                        entry["best_sample_idx"] = int(rewards.argmax().item())
                     self._audit_log.append(entry)
+
+                if debug_dir_active:
+                    self._dump_debug_niter(
+                        plan_dir=plan_dir,
+                        iter_idx=iter_idx,
+                        act_seqs=act_seqs,
+                        rewards=rewards,
+                        weights=weights,
+                        mean=act_seq,
+                    )
 
         # After the optimization loop, re-roll the top-K trajectories from
         # the last iteration and CV-label every step along the rollout, so
