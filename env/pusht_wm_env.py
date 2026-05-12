@@ -105,6 +105,14 @@ class PushTWMEnv:
         # Action dim is fixed by the WM checkpoint; cached so callers don't
         # have to dig into hydra config.
         self.action_dim = 4
+        # Optional multi-frame warmup window. When set, ``rollout`` and
+        # ``dynamics_step`` (via rollout dispatch) use this window as the
+        # WM dynamics context instead of starting from the single frame
+        # passed in by the caller — eliminating the OOD 1..9-frame ramp
+        # at the start of every rollout. Set via ``set_warmup`` and
+        # cleared via ``clear_warmup``. Default ``None`` preserves the
+        # legacy single-frame behavior for all existing callers/tests.
+        self._warmup: tuple[torch.Tensor, torch.Tensor] | None = None
 
     # ── encode / decode ───────────────────────────────────────────────
 
@@ -209,6 +217,35 @@ class PushTWMEnv:
             )
 
         was_batched = _is_batched_latent(z0)
+
+        # Warmup path: if a multi-frame window has been installed via
+        # ``set_warmup``, ignore ``z0``'s content and use the warmup
+        # history as the dynamics context. This eliminates the OOD ramp
+        # where the WM sees only 1..9 frames before reaching its trained
+        # 10-frame window. ``z0``'s batch shape is still used to size
+        # the output. Callers who manage a closed loop are responsible
+        # for keeping ``self._warmup``'s last frame aligned with the
+        # latent they would have passed as ``z0``.
+        if self._warmup is not None:
+            z_history, action_history = self._warmup  # (T_warm, C, H, W), (T_warm, A)
+            if not was_batched:
+                actions = actions.unsqueeze(0)
+                B = 1
+            else:
+                B = z0.shape[0]
+            actions = actions.to(self.device)
+            z_hist_b = (
+                z_history.unsqueeze(0).expand(B, -1, -1, -1, -1).contiguous()
+            )  # (B, T_warm, C, H, W)
+            a_hist_b = (
+                action_history.unsqueeze(0).expand(B, -1, -1).contiguous()
+            )  # (B, T_warm, A)
+            with torch.no_grad():
+                traj = self._wm.rollout(
+                    z_hist_b, actions, action_history=a_hist_b,
+                )  # (B, H+1, C, H_lat, W_lat)
+            return traj if was_batched else traj[0]
+
         if not was_batched:
             z0 = z0.unsqueeze(0)
             actions = actions.unsqueeze(0)
@@ -379,3 +416,170 @@ class PushTWMEnv:
         pre = _preprocess_rgb_uint8(raw, resolution=self.resolution)
         rgb_t = torch.from_numpy(pre).permute(2, 0, 1).unsqueeze(0)
         return self.encode(rgb_t)
+
+    # ── multi-frame warmup ──────────────────────────────────────────
+
+    def load_initial_with_warmup(
+        self,
+        hdf5_path: str | Path,
+        end_frame_index: int,
+        window_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Load a multi-frame warmup window from an HDF5 episode.
+
+        Loads ``window_size`` consecutive RGB frames ending at
+        ``end_frame_index`` (inclusive), encodes each, and pairs them
+        with the expert actions that drove INTO them (convention (b)
+        from the yiru port: ``action_history[i]`` is the expert action
+        from episode step ``frame_idx - 1``, i.e. the action that took
+        the state from frame ``i-1`` to frame ``i``).
+
+        For warmup positions where ``frame_idx - 1 < 0`` (only the very
+        first episode frame), a zero action is used as the placeholder.
+
+        Args:
+            hdf5_path: episode HDF5 file path.
+            end_frame_index: episode index of the LAST warmup frame
+                (inclusive). Rollouts launched against this warmup will
+                effectively predict frames starting at
+                ``end_frame_index + 1``.
+            window_size: number of warmup frames. Capped at the WM's
+                internal context (typically 10); larger values are
+                trimmed by ``DifferentiableDynamics.rollout``.
+
+        Returns:
+            ``(z_history, action_history)`` where:
+
+              * ``z_history``       — ``(window_size, C, H_lat, W_lat)``
+              * ``action_history``  — ``(window_size, action_dim)``
+        """
+        from env.expert_action import expert_action_from_episode
+
+        if window_size < 1:
+            raise ValueError(f"window_size must be >= 1; got {window_size}")
+        start_idx = end_frame_index - window_size + 1
+        if start_idx < 0:
+            raise ValueError(
+                f"window_size={window_size} reaches before frame 0 with "
+                f"end_frame_index={end_frame_index}. Either bump "
+                f"end_frame_index or shrink the window."
+            )
+
+        z_list: list[torch.Tensor] = []
+        a_list: list[torch.Tensor] = []
+        with h5py.File(str(hdf5_path), "r") as f:
+            dset = f[f"obs/images/{PUSHT_CAMERA_KEY}"]
+            for i in range(window_size):
+                frame_idx = start_idx + i
+                raw = dset[int(frame_idx)]
+                pre = _preprocess_rgb_uint8(raw, resolution=self.resolution)
+                rgb_t = torch.from_numpy(pre).permute(2, 0, 1)  # (3, H, W)
+                z_list.append(self.encode(rgb_t))  # (C, H_lat, W_lat)
+
+                prev_idx = frame_idx - 1
+                if prev_idx < 0:
+                    a_list.append(
+                        torch.zeros(
+                            self.action_dim,
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
+                    )
+                else:
+                    a_np = expert_action_from_episode(self, str(hdf5_path), prev_idx)
+                    a_list.append(torch.from_numpy(a_np).to(self.device))
+
+        z_history = torch.stack(z_list, dim=0)         # (T_warm, C, H_lat, W_lat)
+        action_history = torch.stack(a_list, dim=0)    # (T_warm, A)
+        return z_history, action_history
+
+    def set_warmup(
+        self,
+        z_history: torch.Tensor,
+        action_history: torch.Tensor,
+    ) -> None:
+        """Install a multi-frame warmup window on the env.
+
+        When set, subsequent calls to ``rollout`` (and the planner that
+        sits on top of it) automatically use this window as the
+        dynamics context instead of starting from a single frame +
+        dummy zero. This eliminates the OOD ramp at the start of every
+        rollout.
+
+        Args:
+            z_history:       ``(T_warm, C, H_lat, W_lat)``.
+            action_history:  ``(T_warm, action_dim)`` — action[i] is
+                the action that drove INTO z_history[i] (yiru
+                convention (b)). action_history[0] is typically zeros
+                if z_history[0] is the very first episode frame.
+        """
+        if z_history.dim() != 4:
+            raise ValueError(
+                f"z_history must be (T_warm, C, H, W); got {tuple(z_history.shape)}"
+            )
+        if action_history.dim() != 2:
+            raise ValueError(
+                f"action_history must be (T_warm, A); got {tuple(action_history.shape)}"
+            )
+        if z_history.shape[0] != action_history.shape[0]:
+            raise ValueError(
+                f"z_history T_warm ({z_history.shape[0]}) != "
+                f"action_history T_warm ({action_history.shape[0]})"
+            )
+        if action_history.shape[1] != self.action_dim:
+            raise ValueError(
+                f"action_history action_dim ({action_history.shape[1]}) != "
+                f"env.action_dim ({self.action_dim})"
+            )
+        self._warmup = (
+            z_history.to(self.device),
+            action_history.to(self.device),
+        )
+
+    def clear_warmup(self) -> None:
+        """Remove any installed warmup; rollouts return to single-frame init."""
+        self._warmup = None
+
+    def rollout_with_warmup(
+        self,
+        z_history: torch.Tensor,
+        action_history: torch.Tensor,
+        actions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Stateless multi-frame-warmup rollout.
+
+        Equivalent to: ``set_warmup(z_history, action_history)``;
+        ``rollout(z_history[-1], actions)``; ``clear_warmup()`` — but
+        without touching ``self._warmup``. Useful when the caller does
+        not want a stateful env.
+
+        Args:
+            z_history:       ``(T_warm, C, H, W)`` or ``(B, T_warm, C, H, W)``.
+            action_history:  ``(T_warm, A)``       or ``(B, T_warm, A)``.
+            actions:         ``(H, A)``            or ``(B, H, A)``.
+
+        Returns:
+            Latents ``(B, H+1, C, H_lat, W_lat)`` (or ``(H+1, ...)`` if
+            input was unbatched). Index 0 is ``z_history[-1]`` followed
+            by ``H`` predicted latents.
+        """
+        horizon = actions.shape[-2]
+        if horizon > MAX_HORIZON:
+            raise ValueError(
+                f"PushTWMEnv.rollout_with_warmup supports H up to {MAX_HORIZON}; "
+                f"got H={horizon}."
+            )
+
+        was_batched = z_history.dim() == 5
+        if not was_batched:
+            z_history = z_history.unsqueeze(0)
+            action_history = action_history.unsqueeze(0)
+            actions = actions.unsqueeze(0)
+        z_history = z_history.to(self.device)
+        action_history = action_history.to(self.device)
+        actions = actions.to(self.device)
+        with torch.no_grad():
+            traj = self._wm.rollout(
+                z_history, actions, action_history=action_history,
+            )
+        return traj if was_batched else traj[0]

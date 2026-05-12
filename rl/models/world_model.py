@@ -193,23 +193,83 @@ class DifferentiableDynamics(nn.Module):
     # ── multi-step rollout ───────────────────────────────────────────
     def rollout(
         self,
-        z_init: torch.Tensor,    # (B, 1, C, H, W)
-        actions: torch.Tensor,   # (B, H, A)
+        z_init: torch.Tensor,            # (B, 1, C, H, W) or (B, T_warm, C, H, W)
+        actions: torch.Tensor,           # (B, H, A)
         hist_context: int = 10,
+        action_history: torch.Tensor | None = None,  # (B, T_warm, A) — see notes
     ) -> torch.Tensor:
         """Multi-step dynamics rollout.
 
+        Two modes:
+
+        Single-frame init (legacy, ``action_history=None``):
+            ``z_init`` must be ``(B, 1, C, H, W)``. Action history starts
+            with a single dummy zero action. Early steps (t=0..8) see
+            only 1..9 frames of context — OUT OF DISTRIBUTION relative
+            to the model's 10-frame training.
+
+        Multi-frame warmup (NEW, ``action_history`` given):
+            ``z_init`` is ``(B, T_warm, C, H, W)`` — pre-encoded latents
+            of T_warm consecutive real frames. ``action_history`` is
+            ``(B, T_warm, A)`` — the actions that drove those frames
+            (with ``action_history[:, 0]`` typically zeros: convention
+            "action that drove INTO ``z_init[:, 0]``", which doesn't
+            exist for the very first warmup frame). Step 0 of the
+            rollout starts with a FULL T_warm-frame context — in
+            distribution.
+
         Returns:
-            latents: (B, H+1, C, H, W) — z_0 through z_H
+            latents: (B, H+1, C, H, W) — ``z_init[:, -1]`` followed by
+                H predicted latents.
         """
-        B, _, C, Hl, Wl = z_init.shape
         H = actions.shape[1]
         use_ckpt = H > 10
 
-        z = z_init  # (B, 1, C, H, W)
-        latents = [z[:, -1]]  # collect z_0
-        # dummy initial action
-        action_hist = [torch.zeros(B, 1, actions.shape[2], device=z.device)]
+        if action_history is None:
+            # Legacy single-frame path. z_init must be (B, 1, C, H, W).
+            if z_init.dim() != 5 or z_init.shape[1] != 1:
+                raise ValueError(
+                    f"rollout(action_history=None) expects z_init of shape "
+                    f"(B, 1, C, H, W); got {tuple(z_init.shape)}. Pass "
+                    f"action_history to enable multi-frame warmup."
+                )
+            B = z_init.shape[0]
+            z = z_init  # (B, 1, C, H, W)
+            latents = [z[:, -1]]
+            action_hist = [torch.zeros(B, 1, actions.shape[2], device=z.device)]
+        else:
+            # Warmup path: prime z and action_hist from the supplied
+            # history. The returned latents start at the LAST warmup frame.
+            if z_init.dim() != 5 or z_init.shape[1] < 1:
+                raise ValueError(
+                    f"warmup rollout expects z_init (B, T_warm, C, H, W); "
+                    f"got {tuple(z_init.shape)}."
+                )
+            if action_history.dim() != 3:
+                raise ValueError(
+                    f"action_history must be (B, T_warm, A); got "
+                    f"{tuple(action_history.shape)}."
+                )
+            if action_history.shape[0] != z_init.shape[0]:
+                raise ValueError(
+                    f"action_history batch ({action_history.shape[0]}) != "
+                    f"z_init batch ({z_init.shape[0]})."
+                )
+            if action_history.shape[1] != z_init.shape[1]:
+                raise ValueError(
+                    f"action_history T_warm ({action_history.shape[1]}) != "
+                    f"z_init T_warm ({z_init.shape[1]}). Convention: "
+                    f"action_history[:, i] drove INTO z_init[:, i]; "
+                    f"action_history[:, 0] is typically zeros."
+                )
+            # Trim warmup to hist_context — model can't see further back.
+            z = z_init[:, -hist_context:]
+            T_warm = z.shape[1]
+            ahist = action_history[:, -T_warm:]
+            # action_hist as a list of (B, 1, A) tensors so the existing
+            # cat loop below works unchanged.
+            action_hist = [ahist[:, i : i + 1] for i in range(T_warm)]
+            latents = [z[:, -1]]
 
         for t in range(H):
             action_hist.append(actions[:, t : t + 1])  # (B, 1, A)
