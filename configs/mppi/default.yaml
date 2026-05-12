@@ -69,10 +69,15 @@ cumulative_drift_log_only: true   # log ‖a_t − anchor_0‖ but don't clip
 # vanilla MPPI mean drifted >4× demo p99 within 50 niters without this
 # constraint; sample-side clip prevents the WM from ever scoring
 # per-step deltas outside the demo distribution.
-sample_delta_clip: false          # off by default (backward compat)
-per_step_delta_lim: null          # 4-vector per-dim normalized bound;
-                                  # null ⇒ use audit-derived demo p99
-                                  # [0.0975, 0.0919, 0.0760, 0.0909]
+sample_delta_clip: true           # ON: cap per-step Δ at demo p99
+                                  # to avoid the WM action-OOD that
+                                  # drove K=16 oscillation in the
+                                  # 2026-05-12 Phase C run (per-step
+                                  # pose changes were ~100× demo p99;
+                                  # see overnight/yiru_k16_*/01_action_ood_analysis.md).
+per_step_delta_lim: [0.0975, 0.0919, 0.0760, 0.0909]
+                                  # 4-vector per-dim normalized bound;
+                                  # audit-derived demo p99
                                   # (mini dataset, 1989 transitions).
 
 # --- audit logging (NEW) ---
