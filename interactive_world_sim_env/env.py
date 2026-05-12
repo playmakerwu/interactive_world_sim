@@ -449,7 +449,9 @@ class WorldModelEnv:
     # ------------------------------------------------------------ step_batch
 
     def step_batch(
-        self, actions: np.ndarray | torch.Tensor
+        self,
+        actions: np.ndarray | torch.Tensor,
+        decode_batch_size: int = 16,
     ) -> BatchedObservation:
         """Run K parallel rollouts of length H from the current state.
 
@@ -457,6 +459,18 @@ class WorldModelEnv:
         ----------
         actions: (K, H, action_dim) float32 in [-1, 1]. Out-of-range entries
             are silently clipped.
+        decode_batch_size: int, default 16. Maximum number of (k, h) cells
+            decoded in a single ``render_img_cm`` call. The previous
+            implementation flattened to (K*H, ...) and decoded everything
+            at once, allocating ~6 GB for K=4, H=10 on an 11.5 GB GPU and
+            OOMing at K=4. Chunking the decode keeps peak GPU bounded by
+            ``decode_batch_size`` worth of decoder activations rather than
+            ``K*H``. Latent dynamics rollout is unaffected — only the
+            decoder pass is chunked. Set to a non-positive value or
+            >= K*H to skip chunking (matches the pre-fix behavior).
+            See production's MPPIPlanner._estimate_final_states
+            (rl/mppi/mppi_planner.py) for the canonical pattern this
+            mirrors.
 
         Returns
         -------
@@ -499,10 +513,24 @@ class WorldModelEnv:
                 z_batched, a_batched
             )  # (K, H, C, H, W)
 
-        # Decode every (k, h) cell. Flatten the leading two dims for
-        # render_img_cm, then reshape.
+        # Decode every (k, h) cell. Flatten the leading two dims, then
+        # chunk through ``_decode_latents`` to bound peak decoder memory
+        # at ``decode_batch_size`` frames per call rather than K*H. Free
+        # cached blocks between chunks so the next chunk gets a clean
+        # allocator pool (same pattern as production's planner).
         flat = latents.reshape(K * H, *latents.shape[2:])
-        rgb_chw = self._decode_latents(flat)  # (K*H, 3*V, H_img, W_img) uint8
+        total = flat.shape[0]
+        chunk = int(decode_batch_size)
+        if chunk <= 0 or chunk >= total:
+            rgb_chw = self._decode_latents(flat)  # (K*H, 3*V, H_img, W_img) uint8
+        else:
+            parts: list[np.ndarray] = []
+            for start in range(0, total, chunk):
+                end = min(start + chunk, total)
+                parts.append(self._decode_latents(flat[start:end]))
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            rgb_chw = np.concatenate(parts, axis=0)
         rgbs = rgb_chw.reshape(K, H, *rgb_chw.shape[1:])
 
         return BatchedObservation(
