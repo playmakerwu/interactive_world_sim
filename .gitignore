@@ -220,3 +220,7 @@ rl/outputs/
 pre/**/*.mp4
 pre/**/*.pt
 pre/**/*.npz
+
+# Local experiment scratch dirs (not part of canonical pipeline)
+outputs_fail/
+overnight/

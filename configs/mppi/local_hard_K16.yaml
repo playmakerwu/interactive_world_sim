@@ -1,0 +1,158 @@
+# MPPI hyperparameters — faithful port of diffusion-forcing's
+# planner_v0_0 reference. See MPPI_REFERENCE_NOTES.md for the algorithm
+# spec and the rationale for every deviation listed below.
+
+# --- algorithm ---
+n_sample: 16
+                          # Matches reference.
+n_look_ahead: 10
+                          # because IWS WM's n_frames=10 and we don't yet
+                          # support sliding-window rollouts.
+n_update_iter: 10
+                          # Reference uses 50; reduced because IWS decoder is
+                          # compute-bound (each iter at N=100 ≈ 6s decode+CV
+                          # at this resolution; 50 iters would put a single
+                          # plan_step at ~5 minutes).
+noise_level: 0.05         # sigma for the Gaussian action noise. Matches reference.
+reward_weight: 200.0      # Multiplier inside softmax(R * reward_weight).
+                          # Large value = sharp argmax-like selection.
+                          # Matches reference.
+beta_filter: 0.7          # Intra-horizon noise smoothing coefficient.
+                          # NOTE: this is NOT cross-plan-step warm-start.
+                          # See MPPI_REFERENCE_NOTES.md "Three exact formulas"
+                          # for the (mis)understanding history. Matches reference.
+cv_fail_penalty: -10.0    # Reward for CV-failed trajectories.
+
+# --- waypoint sampling (off by default = vanilla MPPI) ---
+waypoints_n: null         # K: number of sparse waypoints in delta space.
+                          # When null, sample (N, H, A) per-step deltas
+                          # directly (faithful port). When set to an int
+                          # 2..H-1, sample (N, K, A) waypoint deltas and
+                          # up-sample to (N, H, A) via the chosen interp,
+                          # mirroring the reference's MPPI_WAYPTS variant
+                          # (planner_v0_0.py:485-580) adapted to delta
+                          # action space. Smoothness lever: K=H/4 typically
+                          # cuts plan ‖Δa‖ by ~(H/K)×.
+waypoints_interp: linear  # "linear" or "cubic" (Catmull-Rom).
+
+# --- action space ---
+action_dim: 4             # ALOHA bimanual end-effector deltas.
+                          # Matches outputs/pusht_cam1/.hydra/config.yaml:105.
+action_lower_lim: [-1.0, -1.0, -1.0, -1.0]
+action_upper_lim: [1.0, 1.0, 1.0, 1.0]
+
+# --- delta-action MPPI mode (NEW) ---
+# When delta_mode=true the planner samples PER-STEP DELTAS (not absolute
+# targets). scripts/run_mppi_v2.py cumsum-integrates these deltas onto a
+# normalized-action anchor (read from initial hdf5 frame) to recover
+# absolute targets, which the WM consumes as before. Backward-compat:
+# delta_mode=false reproduces prior behavior bit-for-bit. Empirical
+# bounds derived in outputs/diagnostics/demo_action_stats_*.md from 1989
+# demo transitions in normalized space (per-dim p99).
+delta_mode: false                 # off by default (backward compat)
+delta_action_lim: 0.0872          # symmetric per-dim p99 from demos
+                                  # (max over dims; per-dim vector is
+                                  # [0.0870, 0.0815, 0.0698, 0.0872]).
+noise_level_delta: 0.02           # ~25% of delta_action_lim, conservative
+cumulative_drift_log_only: true   # log ‖a_t − anchor_0‖ but don't clip
+
+# --- vanilla-mode sample-side per-step delta clip (NEW) ---
+# When sample_delta_clip=true (vanilla mode only), every sampled
+# trajectory has its per-step deltas clipped to ±per_step_delta_lim
+# before the WM rollout. The first step's delta is bounded relative
+# to the previous executed action (anchor); subsequent steps are
+# bounded relative to the previous in-trajectory step. Cube clip
+# [-1, +1] is retained as outer safety. Mutually exclusive with
+# delta_mode (delta_mode already bounds per-step deltas via cumsum;
+# enabling both raises a warning and disables sample_delta_clip).
+# Niter-audit motivation (outputs/diagnostics/niter_evolution_audit_*):
+# vanilla MPPI mean drifted >4× demo p99 within 50 niters without this
+# constraint; sample-side clip prevents the WM from ever scoring
+# per-step deltas outside the demo distribution.
+sample_delta_clip: true           # ON: cap per-step Δ at demo p99
+                                  # to avoid the WM action-OOD that
+                                  # drove K=16 oscillation in the
+                                  # 2026-05-12 Phase C run (per-step
+                                  # pose changes were ~100× demo p99;
+                                  # see overnight/yiru_k16_*/01_action_ood_analysis.md).
+per_step_delta_lim: [0.0975, 0.0919, 0.0760, 0.0909]
+                                  # 4-vector per-dim normalized bound;
+                                  # audit-derived demo p99
+                                  # (mini dataset, 1989 transitions).
+
+# --- audit logging (NEW) ---
+# Persistent per-niter audit of MPPI's optimization trace, dumped as JSON
+# at end of run. Replaces ad-hoc instrumentation patterns previously used
+# for niter-evolution videos and post-hoc OOD analysis. Zero overhead
+# when disabled. When ``audit_log_enabled=true`` the runner writes
+# ``audit_log.json`` next to the other artifacts (or to
+# ``audit_log_path`` if explicitly set). Each entry: ``plan_call_idx``,
+# ``niter`` (-1 for the pre-loop init snapshot, 0..n_update_iter-1
+# inside the loop), ``mean`` (H, A), ``best_sample_reward``. With
+# ``audit_log_record_samples=true`` each in-loop entry additionally
+# carries ``samples`` (N, H, A) and ``sample_rewards`` (N,) — heavier
+# but lets downstream tools plot top-K trajectories, sample-spread
+# diagnostics, etc.
+audit_log_enabled: false
+audit_log_record_samples: false
+audit_log_path: null              # null ⇒ <output_dir>/audit_log.json
+
+# --- debug mode (NEW) ---
+# Comprehensive paper-grade dumps for OOD investigation + cloud-vs-laptop
+# nondeterminism debugging. When ``debug_mode=true`` the runner creates
+# ``<output_dir>/debug/`` (or ``debug_dump_dir``) and dumps a per-run
+# manifest:
+#
+#   debug/
+#     environment.json          CUDA / torch versions, GPU model, attention
+#                               kernel, cudnn flags, git SHA, timestamp
+#     seeds.json                Initial RNG state (torch CPU + CUDA + numpy
+#                               + planner self._gen), hex-encoded
+#     resolved_config.yaml      Fully resolved OmegaConf (defaults expanded)
+#     wm_ckpt_meta.json         WM checkpoint path + MD5 + size
+#     init_state.npz            z0 latent, decoded init RGB, goal state
+#     plan_{k:03d}/
+#       executed_step.npz       Executed action, frames + latents before/after,
+#                               CV pose before/after, reward
+#       niter_{n:02d}.npz       Samples (N,H,A), sample_rewards (N,),
+#                               softmax_weights (N,), mean (H,A),
+#                               best_sample_{idx,reward}.
+#                               If debug_dump_per_sample_rollout: + per-sample
+#                               rollout latents (N, H+1, C, H_lat, W_lat).
+#                               If debug_dump_per_h_cv: + mean-rollout CV pose
+#                               per H step.
+#     manifest.json             List of all dumped files + total size
+#
+# Storage estimate at N=60 H=20 niter=30 T=50:
+#   - Tier 1 (default): ~250 MB
+#   - + per_sample_rollout: ~3 GB additional
+#   - + per_h_cv: negligible storage; +~12 min WM/CV time
+#   - + decoded_full (Tier 2): ~70 GB additional
+#
+# When debug_mode=true the audit_log_* settings are auto-promoted to
+# true regardless of their explicit values so audit_log.json is also
+# written (coarse summary alongside the granular debug dump).
+debug_mode: false
+debug_dump_dir: null              # null ⇒ <output_dir>/debug/
+debug_dump_per_sample_rollout: false   # save all-N rollout latents per niter
+debug_dump_per_h_cv: false        # decode + CV mean rollout per H step per niter
+debug_dump_decoded_full: false    # Tier 2: all-sample H-step RGB (~70 GB)
+debug_storage_warning_gb: 100     # warn (but don't block) if estimate > X
+
+# --- run-loop pacing ---
+# Number of actions executed per plan_step call. With step_each_iter=1
+# (default), the planner is called once per executed action; with N>1,
+# planner.plan_step is called once and N consecutive actions are executed
+# from the converged plan before re-planning. Total executed actions per
+# episode is always cfg.control_steps; number of MPPI calls is
+# ceil(control_steps / step_each_iter). Matches reference
+# exp_sim_control.py (lines 108, 151-155, 219-220).
+step_each_iter: 1
+
+# --- run control (consumed by scripts/run_mppi_v2.py, not by MPPIPlanner) ---
+control_steps: 50         # plan_step calls per episode
+seed: 0                   # planner sampler RNG seed (does not control WM
+                          # denoiser noise — that uses the global CUDA RNG)
+
+# --- CV labeler infra (perf knob, not algorithmic) ---
+cv_n_workers: 16          # 16-worker persistent pool, optimal for N=100 production batches (10x faster than sequential, ~9.5 GB worker RSS). For smaller N (8) cv8 is marginally faster but cv16 still 4.6x over sequential. Set to 0 to disable on small-RAM hosts.

@@ -48,11 +48,11 @@ sys.path.insert(0, str(REPO))
 
 from env.pusht_wm_env import PushTWMEnv  # noqa: E402
 
-EPISODE = REPO / "data/mini/pusht/train/episode_4.hdf5"
-START_FRAME = 32
+EPISODE = REPO / "data/mini/pusht/val/episode_1.hdf5"
+START_FRAME = 59
 H = 10
 N = 16
-NITER = 5
+NITER = 10
 TOP_K = 4
 COLORS = ["tab:blue", "tab:green", "tab:orange", "tab:purple"]
 
@@ -151,11 +151,11 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--audit_log",
-        default=str(REPO / "overnight/two_fixes_2026_05_12_1438/A3_run/audit_log.json"),
+        default=str(REPO / "overnight/local_run_hard_K16_2026_05_12_1738/A3_run/audit_log.json"),
     )
     ap.add_argument(
         "--output_dir",
-        default=str(REPO / "overnight/two_fixes_2026_05_12_1438/viz_action_sampling"),
+        default=str(REPO / "overnight/local_run_hard_K16_2026_05_12_1738/viz_action_sampling"),
     )
     ap.add_argument("--display_size", type=int, default=512,
                     help="Upscale the 128² decoded canvas to this size for display.")
@@ -251,6 +251,10 @@ def main() -> None:
         uv_right = world_xyz_to_pixel(right_xyz, K_cam, ext)
         canvas_right = camera_to_canvas_pixel(uv_right, raw_h, raw_w, target)
         pixels_right_by_niter[n] = canvas_right.reshape(N, H, 2)
+
+        # Visual-only offset; raises trajectories above gripper region for clarity
+        pixels_left_by_niter[n] -= 10
+        pixels_right_by_niter[n] -= 10
 
     # Pre-process start frame to display_size (same crop, then up-scale to 512)
     start_128 = preprocess_rgb_to_128(raw_start)
