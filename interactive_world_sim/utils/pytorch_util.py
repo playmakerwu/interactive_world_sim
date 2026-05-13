@@ -1,3 +1,5 @@
+"""PyTorch utility helpers — dict_apply for recursive tensor transformations."""
+
 import collections
 from typing import Callable, Dict, List
 

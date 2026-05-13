@@ -1,3 +1,5 @@
+"""Consistency-model helpers — DDPMScheduler and related diffusion utilities."""
+
 import math
 import random
 from typing import Any, Optional

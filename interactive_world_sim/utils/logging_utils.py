@@ -1,3 +1,5 @@
+"""Logging helpers for training (video logging, validation metric computation)."""
+
 from typing import Optional
 
 import matplotlib.animation as animation

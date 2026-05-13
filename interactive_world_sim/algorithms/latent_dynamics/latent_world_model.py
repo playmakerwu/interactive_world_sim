@@ -1,3 +1,5 @@
+"""LatentWorldModel — PyTorch Lightning module holding the encoder/decoder/dynamics for the IWS world model."""
+
 import os
 import tracemalloc
 from typing import Any, Callable

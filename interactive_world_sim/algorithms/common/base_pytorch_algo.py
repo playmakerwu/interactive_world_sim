@@ -1,3 +1,5 @@
+"""Abstract base class for PyTorch Lightning training algorithms."""
+
 from abc import ABC, abstractmethod
 from typing import Any, Sequence, Union
 

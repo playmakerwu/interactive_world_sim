@@ -1,3 +1,5 @@
+"""Drawing helpers (concat_img_h/v) used by training-time visualizations."""
+
 import time
 from typing import Optional, Tuple
 

@@ -1,3 +1,8 @@
+"""CMLatentDynamics — consistency-model latent dynamics module (frozen at MPPI inference).
+
+Instantiated via Hydra (`outputs/pusht_cam1/.hydra/config.yaml` → `algorithm.dynamics`).
+"""
+
 from functools import partial
 from typing import Literal, Optional
 

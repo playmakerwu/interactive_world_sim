@@ -1,3 +1,5 @@
+"""Attention layers (self/cross-attention, EinopsWrapper-compatible)."""
+
 from functools import wraps
 from typing import Any, Callable, Optional
 

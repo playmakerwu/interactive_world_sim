@@ -1,3 +1,5 @@
+"""Consistency-model decoder — converts latents back to RGB frames."""
+
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig

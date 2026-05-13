@@ -1,3 +1,5 @@
+"""Model utility helpers — EinopsWrapper, get_einops_wrapped_module."""
+
 import math
 
 import torch

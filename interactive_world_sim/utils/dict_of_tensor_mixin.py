@@ -1,3 +1,5 @@
+"""DictOfTensorMixin — nn.Module mixin for buffers stored as dicts of tensors."""
+
 import torch
 import torch.nn as nn
 

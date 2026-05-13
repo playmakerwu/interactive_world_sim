@@ -1,3 +1,5 @@
+"""Diffusion utility helpers (render_img_cm for sample-time decoding)."""
+
 from typing import Any
 
 import cv2

@@ -1,3 +1,5 @@
+"""LinearNormalizer — affine action/observation normalization (fit + inverse)."""
+
 from typing import Any, Callable, Dict, Optional, Union
 
 import numpy as np

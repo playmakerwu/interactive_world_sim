@@ -1,3 +1,5 @@
+"""Diffusion autoencoder U-Net backbone — used by the consistency-model decoder."""
+
 import math
 from abc import abstractmethod
 from typing import Optional

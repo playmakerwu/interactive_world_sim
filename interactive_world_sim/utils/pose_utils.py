@@ -1,3 +1,5 @@
+"""Pose utility helpers — PoseType enum, pose_convert (training-time only)."""
+
 from enum import Enum
 
 import numpy as np

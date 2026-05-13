@@ -1,3 +1,5 @@
+"""ControlNet-style conditioning U-Net used by the consistency-model decoder."""
+
 from typing import Optional
 
 import torch as th
