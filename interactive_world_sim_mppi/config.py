@@ -1,35 +1,42 @@
 """Configuration for the MPPI planner.
 
-Single source of truth for all tunable hyperparameters. Every field that
-the verbatim-copied algorithmic core (in _mppi_core.py) reads is exposed
-here. No magic numbers live in _mppi_core.py or _splines.py — the
-core reads from a Config instance passed to Planner.__init__.
+Single source of truth for all tunable hyperparameters. Field-for-field
+mirror of production's ``configs/mppi/default.yaml`` (production HEAD
+``5e2d48e``). The new ``Planner`` in ``_planner.py`` reads these via
+attribute access; per-run knobs (control_steps, seed, output paths) are
+consumed by the closed-loop driver at ``scripts/run_mppi.py`` rather
+than by the planner itself.
 
-The Config dataclass is frozen so that an instance can be hashed and
-shared safely across processes. To override a field, use
-`dataclasses.replace(cfg, n_sample=200)`.
+production-default yaml fields are reproduced here with the same names
+and the same default values. Fields added by this package
+(``cv_processing_resolution``, ``image_diagonal``) carry the production
+algorithm's 128-px assumptions.
 
-Source citations (where a default value originates) reference:
-  - planner_v0_0.yaml in diffusion-forcing (paths relative to that repo)
-  - planner_v0_0.py in diffusion-forcing
-  - "OURS" for fields we introduced
+To override a field, use ``dataclasses.replace(cfg, n_sample=200)``.
 
-diffusion-forcing reference SHA: 180a2639a01c593c1a73275abe42b3acf4afc162
+The dataclass is frozen so an instance can be shared safely across
+processes.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
 class GoalPose:
-    """Target T-block pose in the detector's processing-resolution pixel space.
+    """Target T-block pose. Kept for backwards compat with the legacy
+    ``pusht_terminal_reward`` callable. The production-faithful reward
+    path consumes a dict-form goal_state instead.
 
-    For the default processing_resolution=512, x and y are in [0, 512).
-    angle_deg is in degrees (matching aloha's raw unwrapped output).
-    Constructed once at startup (e.g., by detecting on a real episode
-    frame) and frozen for the duration of the run.
+    Attributes
+    ----------
+    x, y : float
+        Pixel coords in the detector's processing-resolution frame
+        (default 128 px to match production).
+    angle_deg : float
+        Aloha-style unwrapped angle in degrees.
     """
 
     x: float
@@ -41,100 +48,172 @@ class GoalPose:
 class Config:
     """All tunable hyperparameters for the MPPI planner.
 
-    Every field that the algorithmic core uses is exposed here. The
-    verbatim-copied planner code reads these via attribute access (set
-    in Planner.__init__ from this Config). No magic numbers live in
-    _mppi_core.py or _splines.py.
+    Defaults mirror production's ``configs/mppi/default.yaml``.
     """
 
-    # ----- MPPI core (from planner_v0_0.yaml) -----
+    # --- algorithm ---
     n_sample: int = 100
-    """K: number of action trajectories sampled per MPPI iteration.
-    Source: planner_v0_0.yaml:3."""
+    """N: trajectory samples per refinement iteration. Production yaml:6."""
 
-    n_waypoints: int = 2
-    """Number of waypoints per plan; replaces diffusion-forcing's
-    n_look_ahead in MPPI_WAYPTS. OURS: small for first runs; spline
-    through [curr_pos, w1, w2] = 3 knots produces a 10-step dense
-    sequence at interp_pts=5."""
+    n_look_ahead: int = 10
+    """H: planning horizon. Production yaml:8."""
 
-    interp_pts: int = 5
-    """Dense actions per waypoint segment; replaces skip_frame.
-    OURS: with n_waypoints=2 and interp_pts=5, dense horizon = 10."""
-
-    n_update_iter: int = 50
-    """Number of MPPI iterations per plan() call.
-    Source: planner_v0_0.yaml:5. n_update_iter=0 is allowed (returns
-    the warm-started initial mean unchanged)."""
-
-    reward_weight: float = 200.0
-    """Inverse temperature for the softmax over rewards.
-    Higher = more peaked weights = exploit; lower = explore.
-    Source: planner_v0_0.yaml:6."""
+    n_update_iter: int = 5
+    """Inner refinement iterations per plan_step. Production yaml:11."""
 
     noise_level: float = 0.05
-    """Gaussian std for action noise.
-    Source: planner_v0_0.yaml:7."""
+    """Sigma for Gaussian action noise. Production yaml:16."""
+
+    reward_weight: float = 200.0
+    """Multiplier inside softmax(R * reward_weight). Production yaml:17."""
 
     beta_filter: float = 0.7
-    """AR(1) low-pass coefficient: residual = beta*new + (1-beta)*old.
-    Source: planner_v0_0.yaml:8."""
+    """Intra-horizon noise smoothing coefficient. Production yaml:20."""
 
-    rollout_best: bool = True
-    """If True, replay the final mean once to capture clean
-    best_model_output / best_eval_output. Source: planner_v0_0.yaml:9."""
+    cv_fail_penalty: float = -10.0
+    """Reward for CV-failed trajectories. Production yaml:24."""
+
+    # --- waypoint sampling (off by default = vanilla MPPI) ---
+    waypoints_n: int | None = None
+    """K: number of sparse waypoints. None = vanilla per-step sampler.
+    Production yaml:27 (null by default)."""
+
+    waypoints_interp: str = "linear"
+    """'linear' or 'cubic' (Catmull-Rom). Production yaml:36."""
+
+    # --- action space ---
+    action_dim: int = 4
+    """ALOHA bimanual end-effector deltas. Production yaml:39."""
 
     action_lower_lim: tuple[float, ...] = (-1.0, -1.0, -1.0, -1.0)
-    """Per-dim lower clip on actions. Hardcoded 4D for pusht_cam1.
-    Source: planner_v0_0.yaml:10 (which uses 2D for original PushT)."""
+    """Per-dim cube lower bound. Production yaml:41."""
 
     action_upper_lim: tuple[float, ...] = (1.0, 1.0, 1.0, 1.0)
-    """Per-dim upper clip on actions. Hardcoded 4D for pusht_cam1.
-    Source: planner_v0_0.yaml:11 (2D in original)."""
+    """Per-dim cube upper bound. Production yaml:42."""
 
-    # ----- Closed-loop / receding horizon -----
+    # --- delta-action MPPI mode ---
+    delta_mode: bool = False
+    """When True, sample per-step DELTAs (cumsum onto anchor at sample
+    time). Production yaml:52."""
+
+    delta_action_lim: float = 0.0872
+    """Symmetric per-dim p99 from demos. Production yaml:53."""
+
+    noise_level_delta: float = 0.02
+    """Sigma in delta_mode. Production yaml:56."""
+
+    cumulative_drift_log_only: bool = True
+    """Log only, don't clip cumulative drift. Production yaml:57."""
+
+    # --- vanilla-mode sample-side per-step delta clip ---
+    sample_delta_clip: bool = True
+    """Cap per-step Δ at demo p99. Production yaml:72 (ON by default)."""
+
+    per_step_delta_lim: tuple[float, ...] = (0.0975, 0.0919, 0.0760, 0.0909)
+    """Per-dim p99 from demos (mini dataset, 1989 transitions).
+    Production yaml:78."""
+
+    # --- audit logging ---
+    audit_log_enabled: bool = False
+    """Persistent per-niter audit JSON. Production yaml:96."""
+
+    audit_log_record_samples: bool = False
+    """Include samples + sample_rewards in each audit entry.
+    Production yaml:97."""
+
+    audit_log_path: str | None = None
+    """When None, audit_log.json sits in the run output_dir.
+    Production yaml:98."""
+
+    # --- debug mode (stub fields; the driver/planner skip work when
+    # debug_mode=False, but the field is exposed for parity with
+    # production's yaml so callers can pass identical config objects). ---
+    debug_mode: bool = False
+    debug_dump_dir: str | None = None
+    debug_dump_per_sample_rollout: bool = False
+    debug_dump_per_h_cv: bool = False
+    debug_dump_decoded_full: bool = False
+    debug_storage_warning_gb: int = 100
+
+    # --- run-loop pacing ---
     step_each_iter: int = 1
-    """Number of waypoints to advance per plan() call in closed-loop
-    operation. The dense actions executed per plan = step_each_iter
-    * interp_pts. Source: pattern from exp_sim_control.py:107
-    (STEP_EACH_ITER constant); semantics resolved in our Phase 2
-    Design §6.2."""
+    """Number of actions executed per plan_step call. Production yaml:150."""
 
-    # ----- OUR extensions to the algorithm -----
-    normalize_rewards_before_softmax: bool = True
-    """OURS: standardize reward_seqs (subtract mean, divide std)
-    before the softmax in optimize_action_mppi. diffusion-forcing
-    relies on tuning reward_weight to match reward scale; we
-    normalize first for scale-invariance. Set False to recover
-    bitwise equivalence with diffusion-forcing's algorithm."""
+    # --- run control (consumed by the driver, not by the planner) ---
+    control_steps: int = 50
+    """Plan_step calls per episode. Production yaml:153."""
 
-    # ----- Reward shaping (for pusht_terminal_reward) -----
+    seed: int = 0
+    """Planner sampler RNG seed (does NOT control WM denoiser noise,
+    which uses the global CUDA RNG). Production yaml:154."""
+
+    # --- CV labeler infra ---
+    cv_n_workers: int = 16
+    """Persistent CV worker pool size for parallel detection.
+    Production yaml:158."""
+
+    cv_processing_resolution: int = 128
+    """detect() processing resolution. Set to 128 to match production's
+    CV-on-decoded-frame pipeline; the WM decodes at 128×128, no further
+    resize."""
+
+    image_diagonal: float = field(default_factory=lambda: math.sqrt(128 ** 2 + 128 ** 2))
+    """Position-term divisor in the reward. sqrt(128² + 128²) ≈ 181.019
+    — matches production's ``PushTWMEnv.image_diagonal``."""
+
+    # --- WorldModelEnv plumbing ---
+    device: str = "cuda"
+    """Torch device for all planner tensors. Production reads device
+    from env; we expose it on the Config for symmetry with diffusion-
+    forcing's Config."""
+
+    decode_batch_size: int = 16
+    """Chunk size for the WorldModelEnv.step_batch decode pass. Pure
+    memory knob — does not change action sampling or scoring."""
+
+    # --- Legacy field kept for backwards compatibility with smoke
+    # scripts and tests that take a Config(goal=GoalPose(...)). The
+    # production-faithful reward path uses a dict goal_state instead;
+    # this field is unused by the new Planner but accepted by Config()
+    # construction.
+    goal: GoalPose | None = None
+
+    # ----- Legacy backwards-compat fields -----
+    # Consumed only by the (now-inactive) verbatim diffusion-forcing
+    # core in _mppi_core.py and by the legacy smoke scripts in
+    # interactive_world_sim_mppi/scripts/smoke_*.py. The new
+    # production-faithful Planner in _planner.py ignores these.
+    n_waypoints: int = 2
+    """LEGACY: n_look_ahead alias used by _mppi_core.py's Planner.
+    Not consumed by the production-faithful _planner.py."""
+
+    interp_pts: int = 5
+    """LEGACY: interp factor for MPPI_WAYPTS in _mppi_core.py."""
+
+    rollout_best: bool = True
+    """LEGACY: rollout-best replay in _mppi_core.py. Not on
+    production's algorithmic path."""
+
+    normalize_rewards_before_softmax: bool = False
+    """LEGACY: yiru's prior reward standardization, deliberately
+    DISABLED by default in this reconciliation (production's MPPI
+    never standardizes; doing so changes the effective softmax
+    temperature). Kept as a field so the legacy verbatim core in
+    _mppi_core.py still constructs."""
+
     pos_weight: float = 1.0
-    """OURS: position-distance weight in reward =
-    -(pos_weight * pos_dist + angle_weight * angle_dist_rad)."""
+    """LEGACY: used by the legacy pusht_terminal_reward (not the
+    production-faithful reward path)."""
 
     angle_weight: float = 1.0
-    """OURS: angle-distance weight (in radians) in the reward."""
+    """LEGACY: used by the legacy pusht_terminal_reward (not the
+    production-faithful reward path)."""
 
-    detection_failure_penalty: float = -1000.0
-    """OURS: reward assigned when the CV detector returns None
-    on a rollout's terminal frame."""
+    detection_failure_penalty: float = -10.0
+    """LEGACY: used by the legacy pusht_terminal_reward. Default is
+    -10.0 to match production's cv_fail_penalty (yiru's prior default
+    was -1000.0 — that was a divergence)."""
 
-    # ----- Runtime / task -----
-    goal: GoalPose | None = None
-    """Target pose. Set at startup, frozen thereafter. MPPIPlanner
-    requires this to be non-None (either via Config(goal=...) or
-    via the planner's goal= kwarg)."""
-
-    device: str = "cuda"
-    """Torch device for all planner tensors. Matches
-    diffusion-forcing's default. Source: planner_v0_0.yaml:12."""
-
-    detector_num_workers: int = 8
-    """Workers for parallel CV detection in PushTTerminalReward.
-    0 or 1 → sequential. OURS: not in diffusion-forcing."""
-
-    cv_processing_resolution: int = 512
-    """detect()'s processing_resolution. Frozen at 512 (the detector
-    default and aloha-pipeline native). Exposed in case future use
-    cases change it. OURS: not in diffusion-forcing."""
+    detector_num_workers: int = 16
+    """LEGACY: aliased by the legacy PushTTerminalReward. Default 16
+    matches production's cv_n_workers."""
