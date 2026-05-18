@@ -587,10 +587,21 @@ def _run_episode(
     # control loop). Initialised at zeros — the "stay-put" prior for an
     # action space of bimanual end-effector deltas in [-1, 1]. NOT
     # ``curr_pos.repeat(...)``: upstream uses absolute poses, we use deltas.
+    
+    anchor_frame = max(0, int(args.initial_frame) - 1)
+    import h5py as _h5py
+    with _h5py.File(args.initial_hdf5, "r") as _f:
+        raw_anchor_np = _f["action"][anchor_frame]
+    raw_anchor = torch.as_tensor(raw_anchor_np, dtype=torch.float32)
+    anchor_norm = env._wm.normalizer["action"].normalize(
+        raw_anchor.unsqueeze(0)
+    ).squeeze(0).to(device=env.device, dtype=torch.float32)
+        
     H = int(cfg.n_look_ahead)
     A = int(cfg.action_dim)
-    act_seq_running = torch.zeros(H, A, device=env.device, dtype=torch.float32)
-
+    act_seq_running = anchor_norm.unsqueeze(0).expand(H, A).clone().to(
+            device=env.device, dtype=torch.float32
+        )
     # Delta-mode (state-anchored MPPI). The planner internally cumsum-
     # integrates sampled per-step deltas onto an anchor and clamps the
     # resulting absolute trajectory to the cube before WM rollout. The
@@ -604,21 +615,13 @@ def _run_episode(
     # is on; both consume planner.set_anchor() / plan_step(anchor=...).
     needs_anchor = delta_mode or sample_delta_clip
     cumulative_drift_log: list[float] = []
-    anchor_norm: torch.Tensor | None = None
     anchor_initial: torch.Tensor | None = None
     if needs_anchor:
         # Read raw action at frame_idx-1 (the action that took us into
         # the initial state; or frame 0 at episode start). Apply the WM's
         # training-time normalizer to land in the same space MPPI samples
         # operate in.
-        anchor_frame = max(0, int(args.initial_frame) - 1)
-        import h5py as _h5py
-        with _h5py.File(args.initial_hdf5, "r") as _f:
-            raw_anchor_np = _f["action"][anchor_frame]
-        raw_anchor = torch.as_tensor(raw_anchor_np, dtype=torch.float32)
-        anchor_norm = env._wm.normalizer["action"].normalize(
-            raw_anchor.unsqueeze(0)
-        ).squeeze(0).to(device=env.device, dtype=torch.float32)
+        
         anchor_initial = anchor_norm.clone()
         if is_rank0:
             tag = "delta_mode" if delta_mode else "sample_delta_clip"

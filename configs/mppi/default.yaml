@@ -5,10 +5,10 @@
 # --- algorithm ---
 n_sample: 100             # N: trajectory samples per refinement iteration.
                           # Matches reference.
-n_look_ahead: 10          # H: planning horizon. Reference uses 40; we use 10
+n_look_ahead: 30          # H: planning horizon. Reference uses 40; we use 10
                           # because IWS WM's n_frames=10 and we don't yet
                           # support sliding-window rollouts.
-n_update_iter: 5          # Inner refinement iterations per plan_step.
+n_update_iter: 30         # Inner refinement iterations per plan_step.
                           # Reference uses 50; reduced because IWS decoder is
                           # compute-bound (each iter at N=100 ≈ 6s decode+CV
                           # at this resolution; 50 iters would put a single
