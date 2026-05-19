@@ -525,9 +525,19 @@ def _run_episode(
             f"Encoding initial state from {args.initial_hdf5} "
             f"frame {args.initial_frame}"
         )
-    z = env.load_initial_from_hdf5(args.initial_hdf5, frame_idx=args.initial_frame)
-    if z.dim() == 4 and z.shape[0] == 1:
-        z = z[0]  # (C, H_lat, W_lat) — planner takes single latent
+    # Multi-frame warmup: load the 10-frame WM context (frames
+    # initial_frame-9 .. initial_frame inclusive) so that env.rollout
+    # (planner scoring) and the closed-loop single-step below both run
+    # in the WM's trained 10-frame regime instead of the 1..9-frame OOD
+    # ramp. Pattern matches scripts/run_mppi_warmup_phase_c.py:376-412.
+    window_size = 10  # WM hardcoded n_frames=10 (rl/models/world_model.py:62-63)
+    z_history, action_history = env.load_initial_with_warmup(
+        args.initial_hdf5,
+        end_frame_index=int(args.initial_frame),
+        window_size=window_size,
+    )
+    env.set_warmup(z_history, action_history)
+    z = z_history[-1]  # (C, H_lat, W_lat); env.rollout ignores content when warmup is set
 
     if is_rank0:
         print(f"Loading goal from {args.goal}")
@@ -667,7 +677,22 @@ def _run_episode(
         # is mode-agnostic in its return contract). a == converged[0].
         for s in range(n_this):
             a_s = a if s == 0 else converged[s].to(env.device)
-            z = env.dynamics_step(z, a_s)
+            # Warmup-aware single-step: route through env.rollout so the
+            # WM sees the full 10-frame context, not just the latest z.
+            # Then slide the warmup window and re-install. Mirrors
+            # scripts/run_mppi_warmup_phase_c.py:496-513.
+            a_dev = a_s.to(env.device)
+            actions_one = a_dev.unsqueeze(0).unsqueeze(0)  # (1, 1, A) batched
+            with torch.no_grad():
+                traj_b = env.rollout(z.unsqueeze(0), actions_one)  # (1, 2, C, H, W)
+            z = traj_b[0, 1]  # (C, H, W)
+            z_history = torch.cat(
+                [z_history[1:], z.unsqueeze(0)], dim=0,
+            )
+            action_history = torch.cat(
+                [action_history[1:], a_dev.unsqueeze(0)], dim=0,
+            )
+            env.set_warmup(z_history, action_history)
             if delta_mode:
                 # Diagnostic: cumulative drift from initial anchor.
                 # Logged-only; the cube clamp inside the planner is the
