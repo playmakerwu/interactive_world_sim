@@ -4,36 +4,23 @@
 
 # --- algorithm ---
 n_sample: 30             # N: trajectory samples per refinement iteration.
-                          # Matches reference.
-n_look_ahead: 10          # H: planning horizon. Reference uses 40; we use 10
-                          # because IWS WM's n_frames=10 and we don't yet
-                          # support sliding-window rollouts.
+
+n_look_ahead: 10          # H: planning horizon.
+
 n_update_iter: 30         # Inner refinement iterations per plan_step.
-                          # Reference uses 50; reduced because IWS decoder is
-                          # compute-bound (each iter at N=100 ≈ 6s decode+CV
-                          # at this resolution; 50 iters would put a single
-                          # plan_step at ~5 minutes).
-noise_level: 0.05         # sigma for the Gaussian action noise. Matches reference.
+                          
+noise_level: 0.05         # sigma for the Gaussian action noise.
+
 reward_weight: 200.0      # Multiplier inside softmax(R * reward_weight).
-                          # Large value = sharp argmax-like selection.
-                          # Matches reference.
+
 beta_filter: 0.7          # Intra-horizon noise smoothing coefficient.
-                          # NOTE: this is NOT cross-plan-step warm-start.
-                          # See MPPI_REFERENCE_NOTES.md "Three exact formulas"
-                          # for the (mis)understanding history. Matches reference.
+
 cv_fail_penalty: -10.0    # Reward for CV-failed trajectories.
 
 # --- waypoint sampling (off by default = vanilla MPPI) ---
 waypoints_n: 3         # K: number of sparse waypoints in delta space.
-                          # When null, sample (N, H, A) per-step deltas
-                          # directly (faithful port). When set to an int
-                          # 2..H-1, sample (N, K, A) waypoint deltas and
-                          # up-sample to (N, H, A) via the chosen interp,
-                          # mirroring the reference's MPPI_WAYPTS variant
-                          # (planner_v0_0.py:485-580) adapted to delta
-                          # action space. Smoothness lever: K=H/4 typically
-                          # cuts plan ‖Δa‖ by ~(H/K)×.
-waypoints_interp: cubic  # "linear" or "cubic" (Catmull-Rom).
+
+waypoints_interp: cubic  # "linear" or "cubic"
 
 # --- action space ---
 action_dim: 4             # ALOHA bimanual end-effector deltas.
