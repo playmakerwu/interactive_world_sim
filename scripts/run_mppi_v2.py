@@ -619,26 +619,19 @@ def _run_episode(
     # plan_step calls — no caller-side integration. See
     # outputs/diagnostics/demo_action_stats_*.md for empirical bounds and
     # outputs/diagnostics/clip_logic_audit_*.md for design rationale.
-    delta_mode = bool(getattr(cfg, "delta_mode", False))
     sample_delta_clip = bool(getattr(cfg, "sample_delta_clip", False))
-    # Anchor is needed when EITHER delta_mode OR (vanilla + sample_delta_clip)
-    # is on; both consume planner.set_anchor() / plan_step(anchor=...).
-    needs_anchor = delta_mode or sample_delta_clip
-    cumulative_drift_log: list[float] = []
-    anchor_initial: torch.Tensor | None = None
-    if needs_anchor:
+    # Anchor is needed when sample_delta_clip is on; the planner consumes
+    # it via planner.set_anchor() / plan_step(anchor=...).
+    needs_anchor = sample_delta_clip
+    if needs_anchor and is_rank0:
         # Read raw action at frame_idx-1 (the action that took us into
         # the initial state; or frame 0 at episode start). Apply the WM's
         # training-time normalizer to land in the same space MPPI samples
         # operate in.
-        
-        anchor_initial = anchor_norm.clone()
-        if is_rank0:
-            tag = "delta_mode" if delta_mode else "sample_delta_clip"
-            print(
-                f"[{tag}] anchor from frame {anchor_frame}: "
-                f"raw={raw_anchor.tolist()}  normalized={anchor_norm.tolist()}"
-            )
+        print(
+            f"[sample_delta_clip] anchor from frame {anchor_frame}: "
+            f"raw={raw_anchor.tolist()}  normalized={anchor_norm.tolist()}"
+        )
 
     step_each_iter = int(getattr(cfg, "step_each_iter", 1))
     t0_run = time.time()
@@ -663,18 +656,17 @@ def _run_episode(
         init_act = act_seq_running if USE_WARM_START else None
         a, iter_log = planner.plan_step(
             z, goal, init_act_seq=init_act, return_iteration_log=True,
-            anchor=anchor_norm,  # required in delta_mode; ignored in vanilla
+            anchor=anchor_norm,  # required when sample_delta_clip=True
         )                                           # (action_dim,), list[n_iter]
         # ``planner.last_stats.act_seq`` lives on CPU as (H, A); every rank
         # has bit-identical bytes (see mppi_planner.optimize_action_mppi
-        # determinism note). It is ABSOLUTE in both modes — the delta_mode
-        # cumsum + cube clamp happens inside the planner before WM scoring.
+        # determinism note). It is ABSOLUTE; the cube clamp happens inside
+        # the planner before WM scoring.
         converged = planner.last_stats.act_seq.detach().cpu().clone()
         plan_wall = time.time() - t0_plan
 
         # Execute n_this absolute actions against the WM. ``converged`` is
-        # an absolute trajectory in the cube regardless of mode (the planner
-        # is mode-agnostic in its return contract). a == converged[0].
+        # an absolute trajectory in the cube. a == converged[0].
         for s in range(n_this):
             a_s = a if s == 0 else converged[s].to(env.device)
             # Warmup-aware single-step: route through env.rollout so the
@@ -693,17 +685,6 @@ def _run_episode(
                 [action_history[1:], a_dev.unsqueeze(0)], dim=0,
             )
             env.set_warmup(z_history, action_history)
-            if delta_mode:
-                # Diagnostic: cumulative drift from initial anchor.
-                # Logged-only; the cube clamp inside the planner is the
-                # actual safety bound.
-                drift = float((a_s - anchor_initial).norm().item())
-                cumulative_drift_log.append(drift)
-                if drift > 1.83:  # demo p99 50-step coverage
-                    print(
-                        f"[delta_mode WARN] t={n_actions_done + s + 1} "
-                        f"cumulative drift {drift:.3f} > demo p99 1.83"
-                    )
             if is_rank0:
                 rgb_t = env.decode(z)
                 rgb_t_u8 = (
@@ -729,7 +710,6 @@ def _run_episode(
                     "cy": float(state_t["cy"]) if state_t["success"] else None,
                     "theta_deg": float(state_t["theta_deg"]) if state_t["success"] else None,
                     "plan_wall_s": round(plan_wall, 3) if s == 0 else 0.0,
-                    "cumulative_drift": round(cumulative_drift_log[-1], 4) if delta_mode else None,
                 })
                 print(
                     f"  t={n_actions_done + s + 1:02d}  r={float(r_t):+.4f}  "
@@ -766,29 +746,17 @@ def _run_episode(
             )
 
         if USE_WARM_START:
-            # Shift-and-pad by n_this. In delta_mode the warm-start
-            # carried back to the planner is the residual delta plan
-            # the optimizer would re-perturb; we cold-restart with zeros
-            # (no carry) since the anchor advancement encodes "where we
-            # are" and the planner now does the cumsum internally.
-            # In vanilla, repeat-last-action is the reference behavior.
+            # Shift-and-pad by n_this; repeat-last-action is the reference behavior.
             converged_dev = converged.to(env.device)
-            if delta_mode:
-                act_seq_running = torch.zeros(
-                    H, A, device=env.device, dtype=torch.float32,
-                )
-            else:
-                new_tail = converged_dev[-1:].repeat(n_this, 1)
-                act_seq_running = torch.cat(
-                    [converged_dev[n_this:], new_tail], dim=0
-                )
+            new_tail = converged_dev[-1:].repeat(n_this, 1)
+            act_seq_running = torch.cat(
+                [converged_dev[n_this:], new_tail], dim=0
+            )
 
         if needs_anchor:
             # Advance anchor to the last absolute action we just executed
-            # (already in the cube — the planner's clamp ran). For
-            # delta_mode subsequent plans cumsum-integrate from here; for
-            # vanilla+sample_delta_clip subsequent plans bound their
-            # first-step delta against this point.
+            # (already in the cube — the planner's clamp ran). Subsequent
+            # plans bound their first-step delta against this point.
             anchor_norm = converged[n_this - 1].to(env.device).detach().clone()
 
         n_actions_done += n_this
@@ -904,14 +872,6 @@ def _run_episode(
         "wall_time_s": round(wall_total, 1),
         "wall_per_step_s": round(wall_total / max(1, int(cfg.control_steps)), 3),
         "n_gpus": int(getattr(args, "n_gpus", 1) or 1),
-        "delta_mode": bool(delta_mode),
-        "cumulative_drift_log": (
-            [round(v, 4) for v in cumulative_drift_log] if delta_mode else None
-        ),
-        "cumulative_drift_max": (
-            round(max(cumulative_drift_log), 4)
-            if delta_mode and cumulative_drift_log else None
-        ),
         "per_step": per_step,
     }
     summary["iteration_reward_viz"] = _write_iteration_visualizations(

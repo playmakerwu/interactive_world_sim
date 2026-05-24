@@ -28,30 +28,12 @@ action_dim: 4             # ALOHA bimanual end-effector deltas.
 action_lower_lim: [-1.0, -1.0, -1.0, -1.0]
 action_upper_lim: [1.0, 1.0, 1.0, 1.0]
 
-# --- delta-action MPPI mode (NEW) ---
-# When delta_mode=true the planner samples PER-STEP DELTAS (not absolute
-# targets). scripts/run_mppi_v2.py cumsum-integrates these deltas onto a
-# normalized-action anchor (read from initial hdf5 frame) to recover
-# absolute targets, which the WM consumes as before. Backward-compat:
-# delta_mode=false reproduces prior behavior bit-for-bit. Empirical
-# bounds derived in outputs/diagnostics/demo_action_stats_*.md from 1989
-# demo transitions in normalized space (per-dim p99).
-delta_mode: false                 # off by default (backward compat)
-delta_action_lim: 0.0872          # symmetric per-dim p99 from demos
-                                  # (max over dims; per-dim vector is
-                                  # [0.0870, 0.0815, 0.0698, 0.0872]).
-noise_level_delta: 0.02           # ~25% of delta_action_lim, conservative
-cumulative_drift_log_only: true   # log ‖a_t − anchor_0‖ but don't clip
-
-# --- vanilla-mode sample-side per-step delta clip (NEW) ---
-# When sample_delta_clip=true (vanilla mode only), every sampled
-# trajectory has its per-step deltas clipped to ±per_step_delta_lim
-# before the WM rollout. The first step's delta is bounded relative
-# to the previous executed action (anchor); subsequent steps are
-# bounded relative to the previous in-trajectory step. Cube clip
-# [-1, +1] is retained as outer safety. Mutually exclusive with
-# delta_mode (delta_mode already bounds per-step deltas via cumsum;
-# enabling both raises a warning and disables sample_delta_clip).
+# --- vanilla-mode sample-side per-step delta clip ---
+# When sample_delta_clip=true, every sampled trajectory has its per-step
+# deltas clipped to ±per_step_delta_lim before the WM rollout. The first
+# step's delta is bounded relative to the previous executed action
+# (anchor); subsequent steps are bounded relative to the previous
+# in-trajectory step. Cube clip [-1, +1] is retained as outer safety.
 # Niter-audit motivation (outputs/diagnostics/niter_evolution_audit_*):
 # vanilla MPPI mean drifted >4× demo p99 within 50 niters without this
 # constraint; sample-side clip prevents the WM from ever scoring

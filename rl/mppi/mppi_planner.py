@@ -81,12 +81,10 @@ class MPPIPlanner:
         self._gen = torch.Generator(device=self.device)
         self._gen.manual_seed(int(self.cfg.seed))
 
-        # Anchor for delta_mode AND vanilla sample_delta_clip. Caller sets
-        # via set_anchor() before each plan_step.
-        # - delta_mode: required; cumsum-integration anchor.
-        # - vanilla + sample_delta_clip: required; first-step delta is
-        #   bounded relative to this anchor (previous executed action).
-        # - vanilla + no clip: ignored.
+        # Anchor for sample_delta_clip. Caller sets via set_anchor()
+        # before each plan_step. When sample_delta_clip is enabled the
+        # first-step delta is bounded relative to this anchor (previous
+        # executed action); otherwise ignored.
         self._anchor: torch.Tensor | None = None
 
         # Resolve per_step_delta_lim default. yaml may set null ⇒ use
@@ -95,7 +93,7 @@ class MPPIPlanner:
         if bool(getattr(self.cfg, "sample_delta_clip", False)):
             lim_cfg = getattr(self.cfg, "per_step_delta_lim", None)
             if lim_cfg is None:
-                lim_default = [0.0975, 0.0919, 0.0760, 0.0909]
+                lim_default = [0.1, 0.1, 0.1, 0.1]
                 if int(self.cfg.action_dim) != len(lim_default):
                     raise ValueError(
                         "per_step_delta_lim default is hardcoded for "
@@ -229,10 +227,8 @@ class MPPIPlanner:
     def set_anchor(self, anchor: torch.Tensor) -> None:
         """Set the absolute-action anchor.
 
-        Used by:
-          - delta_mode=True: cumsum integration onto this anchor.
-          - vanilla + sample_delta_clip=True: first-step delta is bounded
-            relative to this anchor.
+        Used by sample_delta_clip=True: first-step delta is bounded
+        relative to this anchor.
         """
         self._anchor = anchor.to(
             device=self.device, dtype=torch.float32,
@@ -250,9 +246,7 @@ class MPPIPlanner:
           - ``‖samples[:, t] - samples[:, t-1]‖∞ ≤ lim`` per dim, for t≥1
           - cube clip ``[lower_lim, upper_lim]`` retained as outer safety
 
-        Operates in-place on ``samples`` for memory efficiency. Vanilla
-        mode only — delta_mode already cumsum-bounds via the per-step
-        delta clamp inside ``sample_action_sequences``.
+        Operates in-place on ``samples`` for memory efficiency.
         """
         assert self._sample_delta_lim is not None, (
             "_apply_sample_delta_clip called without _sample_delta_lim set"
@@ -289,26 +283,15 @@ class MPPIPlanner:
     def sample_action_sequences(self, act_seq: torch.Tensor) -> torch.Tensor:
         """``(H, A) -> (N, H, A)`` of ABSOLUTE action sequences.
 
-        In vanilla mode (delta_mode=False), this is a faithful port of
-        reference ``planner_v0_0.py:196-256``: AR(1) Gaussian perturbation
-        on absolute actions with per-step clamp to ``[action_lower_lim,
-        action_upper_lim]``.
-
-        In delta mode, the same AR(1) loop generates per-step deltas
-        clamped to ``±delta_action_lim``, then we cumsum-integrate them
-        onto ``self._anchor`` and clamp the resulting absolute sequence
-        to the cube. This way the WM rollout during MPPI scoring sees the
-        same absolute actions that will be executed at the env (fixes
-        the planning/execution mismatch from the prior delta_mode
-        implementation).
+        Faithful port of reference ``planner_v0_0.py:196-256``: AR(1)
+        Gaussian perturbation on absolute actions with per-step clamp to
+        ``[action_lower_lim, action_upper_lim]``.
 
         When ``cfg.waypoints_n`` is a positive int K < H, sampling is
-        delegated to ``_sample_waypoints_then_interp`` which applies the
-        same delta_mode integration after waypoint up-sampling.
+        delegated to ``_sample_waypoints_then_interp``.
 
         Returns: ``(N, H, A)`` absolute actions in
-        ``[action_lower_lim, action_upper_lim]`` (the cube), regardless
-        of mode.
+        ``[action_lower_lim, action_upper_lim]`` (the cube).
         """
         K_wp = getattr(self.cfg, "waypoints_n", None)
         if K_wp is not None and int(K_wp) > 0:
@@ -318,8 +301,7 @@ class MPPIPlanner:
         H = int(self.cfg.n_look_ahead)
         A = int(self.cfg.action_dim)
         beta = float(self.cfg.beta_filter)
-        delta_mode = bool(getattr(self.cfg, "delta_mode", False))
-        sigma, lo, hi = self._sampler_sigma_and_bounds(A)
+        sigma, lo, hi = self._sampler_sigma_and_bounds()
 
         assert act_seq.shape == (H, A), (
             f"act_seq must be (H={H}, A={A}); got {tuple(act_seq.shape)}"
@@ -335,52 +317,17 @@ class MPPIPlanner:
             ) * sigma
             act_residual = beta * noise_sample + (1.0 - beta) * act_residual
             new_step = act_seqs[:, i] + act_residual
-            # In vanilla, lo/hi are ±1 (cube) and clamping the absolute
-            # is correct. In delta_mode, lo/hi are ±delta_action_lim and
-            # we are clamping per-step deltas; the cube clamp on the
-            # integrated absolute happens below.
             new_step = torch.clamp(new_step, lo, hi)
             act_seqs[:, i] = new_step
 
-        if delta_mode:
-            if self._anchor is None:
-                raise RuntimeError(
-                    "sample_action_sequences: delta_mode=True requires "
-                    "planner.set_anchor(...) before plan_step. Got "
-                    "self._anchor=None."
-                )
-            # act_seqs holds per-step deltas clamped to ±delta_action_lim.
-            # Cumsum-integrate onto anchor, then clamp the absolute path
-            # to the cube. The WM rollout that scores these samples will
-            # see exactly what the env executes — no planning/execution
-            # mismatch.
-            abs_seqs = self._anchor.view(1, 1, -1) + act_seqs.cumsum(dim=1)
-            abs_seqs = torch.clamp(
-                abs_seqs, self.action_lower_lim, self.action_upper_lim,
-            )
-            return abs_seqs
-
         if getattr(self, "_sample_delta_lim", None) is not None:
-            # Vanilla + sample_delta_clip: bound per-step deltas (and
-            # first-step delta against anchor) to demo per-dim p99.
+            # sample_delta_clip: bound per-step deltas (and first-step
+            # delta against anchor) to demo per-dim p99.
             act_seqs = self._apply_sample_delta_clip(act_seqs, self._anchor)
         return act_seqs
 
-    def _sampler_sigma_and_bounds(self, A: int):
-        """Pick noise sigma and per-step clip bounds for the active mode.
-
-        delta_mode=True: sigma = noise_level_delta; bounds = ±delta_action_lim per dim.
-          (Per-step DELTA bounds — not absolute. Absolute clamp happens
-          after cumsum integration in sample_action_sequences.)
-        delta_mode=False (default): sigma = noise_level; bounds = action_{lower,upper}_lim.
-          (Absolute cube bounds.)
-        """
-        if bool(getattr(self.cfg, "delta_mode", False)):
-            sigma = float(self.cfg.noise_level_delta)
-            lim = float(self.cfg.delta_action_lim)
-            lo = torch.full((A,), -lim, dtype=torch.float32, device=self.device)
-            hi = torch.full((A,),  lim, dtype=torch.float32, device=self.device)
-            return sigma, lo, hi
+    def _sampler_sigma_and_bounds(self):
+        """Noise sigma + per-step absolute clip bounds (the cube)."""
         return float(self.cfg.noise_level), self.action_lower_lim, self.action_upper_lim
 
     def _sample_waypoints_then_interp(
@@ -393,15 +340,14 @@ class MPPIPlanner:
         the existing AR(1) Gaussian sampler with horizon=K, then up-sample
         to (N, H, A). Interpolation is linear (default) or cubic (Catmull-Rom).
 
-        Returns ``(N, H, A)`` ABSOLUTE action sequences in the cube,
-        regardless of mode (mirrors ``sample_action_sequences``).
+        Returns ``(N, H, A)`` ABSOLUTE action sequences in the cube
+        (mirrors ``sample_action_sequences``).
         """
         N = int(self.cfg.n_sample)
         H = int(self.cfg.n_look_ahead)
         A = int(self.cfg.action_dim)
         beta = float(self.cfg.beta_filter)
-        delta_mode = bool(getattr(self.cfg, "delta_mode", False))
-        sigma, lo, hi = self._sampler_sigma_and_bounds(A)
+        sigma, lo, hi = self._sampler_sigma_and_bounds()
         mode = str(getattr(self.cfg, "waypoints_interp", "linear"))
 
         assert 2 <= K < H, f"waypoints_n must be in [2, H-1]; got {K} (H={H})"
@@ -427,28 +373,12 @@ class MPPIPlanner:
         # Up-sample (N, K, A) -> (N, H, A) at integer timesteps 0..H-1.
         t_out = torch.arange(H, device=self.device, dtype=torch.float32)
         act_seqs = self._interp_along_dim(wp_seqs, t_wp.float(), t_out, mode=mode)
-        # Per-step clamp: in vanilla, lo/hi are ±1 (cube — correct). In
-        # delta_mode, lo/hi are ±delta_action_lim and we clamp the
-        # interpolated per-step deltas; absolute clamp happens after
-        # cumsum below.
         act_seqs = torch.clamp(act_seqs, lo, hi)
 
-        if delta_mode:
-            if self._anchor is None:
-                raise RuntimeError(
-                    "_sample_waypoints_then_interp: delta_mode=True requires "
-                    "planner.set_anchor(...) before plan_step."
-                )
-            abs_seqs = self._anchor.view(1, 1, -1) + act_seqs.cumsum(dim=1)
-            abs_seqs = torch.clamp(
-                abs_seqs, self.action_lower_lim, self.action_upper_lim,
-            )
-            return abs_seqs
-
         if getattr(self, "_sample_delta_lim", None) is not None:
-            # Vanilla + sample_delta_clip: clip applies AFTER waypoint
-            # interpolation, so the clip operates on the per-step
-            # trajectory at WM-rollout resolution (not on waypoints).
+            # sample_delta_clip: clip applies AFTER waypoint interpolation,
+            # so it operates on the per-step trajectory at WM-rollout
+            # resolution (not on waypoints).
             act_seqs = self._apply_sample_delta_clip(act_seqs, self._anchor)
         return act_seqs
 
@@ -839,37 +769,24 @@ class MPPIPlanner:
         Args:
             z_current: current latent.
             goal_state: scalar goal-state dict.
-            init_act_seq: optional initial action sequence. In vanilla
-                mode it's an absolute warm-start; in delta_mode it's a
-                delta warm-start (sampler perturbs deltas around it).
+            init_act_seq: optional absolute-action warm-start.
             return_iteration_log: when True, also return the per-iteration
                 reward/weight records captured during this plan step.
-            anchor: required when delta_mode=True OR when vanilla mode
-                has sample_delta_clip=True. Absolute current action (in
-                normalized [-1,+1]). In delta_mode it's the cumsum
-                integration anchor; in vanilla+clip it bounds the
-                first-step delta. Ignored otherwise.
+            anchor: required when sample_delta_clip=True. Absolute current
+                action (in normalized [-1,+1]). Bounds the first-step
+                delta. Ignored when sample_delta_clip=False.
 
-        Returns the FIRST ABSOLUTE action (mode-agnostic). The full
-        absolute trajectory is on ``self.last_stats.act_seq``.
+        Returns the FIRST ABSOLUTE action. The full absolute trajectory
+        is on ``self.last_stats.act_seq``.
         """
-        delta_mode = bool(getattr(self.cfg, "delta_mode", False))
-        sample_delta_clip = bool(getattr(self.cfg, "sample_delta_clip", False))
-        if delta_mode:
-            if anchor is None:
-                raise RuntimeError(
-                    "plan_step: delta_mode=True requires anchor=...; "
-                    "got anchor=None."
-                )
-            self.set_anchor(anchor)
-        elif sample_delta_clip:
+        if bool(getattr(self.cfg, "sample_delta_clip", False)):
             if anchor is None:
                 raise RuntimeError(
                     "plan_step: sample_delta_clip=True requires anchor=...; "
                     "got anchor=None."
                 )
             self.set_anchor(anchor)
-        # When neither feature is on, anchor is ignored.
+        # When sample_delta_clip is off, anchor is ignored.
 
         act_seq, stats = self.trajectory_optimization(z_current, goal_state, init_act_seq)
         action = act_seq[0]
@@ -1020,17 +937,3 @@ class MPPIPlanner:
             raise ValueError(
                 f"config action_dim {self.cfg.action_dim} != env.action_dim {self.env.action_dim}"
             )
-        if (bool(getattr(self.cfg, "delta_mode", False))
-                and bool(getattr(self.cfg, "sample_delta_clip", False))):
-            import warnings
-            warnings.warn(
-                "MPPI config: sample_delta_clip=True is ignored in "
-                "delta_mode (delta_mode already bounds per-step deltas "
-                "via cumsum). Setting sample_delta_clip to False for "
-                "this planner instance.",
-                stacklevel=2,
-            )
-            try:
-                self.cfg.sample_delta_clip = False
-            except Exception:
-                pass
