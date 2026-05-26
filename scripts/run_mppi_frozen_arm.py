@@ -56,6 +56,31 @@ PAIRS: dict[str, dict[str, Any]] = {
         "initial_frame": 59,
         "goal": "outputs/goals_from_candidates/20260519_002420/hard_goal.pt",
     },
+    "top1": {
+        "hdf5": "data/full/pusht/train/episode_472.hdf5",
+        "initial_frame": 11,
+        "goal": "outputs/goals_from_candidates/20260525_033022/top1_goal.pt",
+    },
+    "top5": {
+        "hdf5": "data/full/pusht/train/episode_483.hdf5",
+        "initial_frame": 5,
+        "goal": "outputs/goals_from_candidates/20260525_033022/top5_goal.pt",
+    },
+    "top10": {
+        "hdf5": "data/full/pusht/train/episode_233.hdf5",
+        "initial_frame": 26,
+        "goal": "outputs/goals_from_candidates/20260525_033022/top10_goal.pt",
+    },
+    "synthetic_top1plus": {
+        "hdf5": "data/full/pusht/train/episode_472.hdf5",
+        "initial_frame": 11,
+        "goal": "outputs/goals_from_candidates/20260525_163637_synthetic/synthetic_top1plus_goal.pt",
+    },
+    "synthetic_top1plus_v2": {
+        "hdf5": "data/full/pusht/train/episode_472.hdf5",
+        "initial_frame": 11,
+        "goal": "outputs/goals_from_candidates/20260525_164912_synthetic_v2/synthetic_top1plus_v2_goal.pt",
+    },
 }
 
 
