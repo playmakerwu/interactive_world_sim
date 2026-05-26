@@ -104,23 +104,13 @@ def _convert_real_to_dp_replay(
             # save lowdim data to lowedim_data_dict
             if "action" not in lowdim_data_dict:
                 lowdim_data_dict["action"] = list()
-            action_ls = []
-            for t in range(file["obs"]["full_joint_pos"].shape[0]):
-                joint_pos = file["obs"]["joint_pos"][t]
-                num_rob = joint_pos.shape[0] // 7
-                for r_i in range(num_rob):
-                    joint_pos[r_i * 7 + 6] = MASTER_GRIPPER_JOINT_UNNORMALIZE_FN(
-                        PUPPET_GRIPPER_JOINT_NORMALIZE_FN(joint_pos[r_i * 7 + 6])
-                    )
-                action = joint_pos_to_action_primitive(
-                    joint_pos=joint_pos,
-                    ctrl_mode=ctrl_mode,
-                    base_pose_in_world=file["obs"]["world_t_robot_base"][t],
-                    kin_helper=kin_helper,
-                )
-                action_ls.append(action)
-            action_data = np.concatenate(action_ls)
-            # preventing overgrasping
+            # leader-FK ee-pose: read file["action"] directly
+            # (was: FK(obs/joint_pos) which gave follower-derived ee-pose; see
+            # outputs/diagnostics/iws_action_semantics_followup_*.md).
+            action_data = np.asarray(file["action"][:])
+            # preventing overgrasping (kept for single_grasp parity — redundant
+            # now since action_data already comes from file["action"], but
+            # harmless and preserves the original gripper-override intent).
             if ctrl_mode == "single_grasp":
                 action_data[:, -1] = file["action"][:, -1]
             lowdim_data_dict["action"].append(action_data)
