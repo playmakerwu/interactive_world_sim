@@ -634,6 +634,22 @@ def _run_episode(
         )
 
     step_each_iter = int(getattr(cfg, "step_each_iter", 1))
+
+    # EMA smoothing on executed mu[0] (Option A). Default OFF: byte-identical
+    # to pre-EMA behavior. When enabled, the runner post-processes the
+    # action returned by planner.plan_step BEFORE env.rollout — planner
+    # internals (anchor advancement, warm-start, sample_delta_clip) are
+    # unaffected.
+    ema_enabled = bool(OmegaConf.select(cfg, "action_ema.enabled", default=False))
+    ema_alpha = float(OmegaConf.select(cfg, "action_ema.alpha", default=0.3))
+    ema_init_mode = str(OmegaConf.select(cfg, "action_ema.init_mode", default="first_mu"))
+    if ema_enabled and ema_init_mode not in ("first_mu", "anchor"):
+        raise ValueError(
+            f"unknown action_ema.init_mode: {ema_init_mode!r}; "
+            "expected 'first_mu' or 'anchor'"
+        )
+    a_prev: np.ndarray | None = None
+
     t0_run = time.time()
     n_actions_done = 0
     while n_actions_done < int(cfg.control_steps):
@@ -665,8 +681,27 @@ def _run_episode(
         converged = planner.last_stats.act_seq.detach().cpu().clone()
         plan_wall = time.time() - t0_plan
 
+        # EMA smoothing on executed mu[0]. Only modifies ``a`` (used at
+        # s==0 in the substep loop below). ``converged`` is untouched —
+        # warm-start, anchor advancement, and substeps for s>0 all see
+        # the planner's raw trajectory exactly as before.
+        mu_raw_np: np.ndarray | None = None
+        ema_l2_val: float = 0.0
+        if ema_enabled:
+            mu_raw_np = a.detach().cpu().numpy().copy()
+            if a_prev is None:
+                if ema_init_mode == "first_mu":
+                    a_prev = mu_raw_np.copy()
+                else:  # "anchor" — validated at config-read time
+                    a_prev = anchor_norm.detach().cpu().numpy().copy()
+            a_exec_np = ema_alpha * mu_raw_np + (1.0 - ema_alpha) * a_prev
+            a_prev = a_exec_np.copy()
+            ema_l2_val = float(np.linalg.norm(a_exec_np - mu_raw_np))
+            a = torch.from_numpy(a_exec_np).to(a.device).to(a.dtype)
+
         # Execute n_this absolute actions against the WM. ``converged`` is
-        # an absolute trajectory in the cube. a == converged[0].
+        # an absolute trajectory in the cube. a == converged[0]
+        # (or, when EMA on, a == EMA-smoothed converged[0]).
         for s in range(n_this):
             a_s = a if s == 0 else converged[s].to(env.device)
             # Warmup-aware single-step: route through env.rollout so the
@@ -701,7 +736,7 @@ def _run_episode(
                 # plan call; subsequent sub-steps within the same plan
                 # report 0.0 so summing per_step still yields total plan
                 # wall time.
-                per_step.append({
+                _entry = {
                     "t": n_actions_done + s + 1,
                     "action": [float(v) for v in a_s.tolist()],
                     "reward": float(r_t),
@@ -710,7 +745,19 @@ def _run_episode(
                     "cy": float(state_t["cy"]) if state_t["success"] else None,
                     "theta_deg": float(state_t["theta_deg"]) if state_t["success"] else None,
                     "plan_wall_s": round(plan_wall, 3) if s == 0 else 0.0,
-                })
+                }
+                if ema_enabled:
+                    if s == 0 and mu_raw_np is not None:
+                        _entry["action_raw"] = [float(v) for v in mu_raw_np.tolist()]
+                        _entry["ema_l2"] = ema_l2_val
+                    else:
+                        # substep (s > 0) — EMA not applied; raw == executed.
+                        _entry["action_raw"] = _entry["action"]
+                        _entry["ema_l2"] = 0.0
+                per_step.append(_entry)
+                _ema_token = (
+                    f"  ema_l2={ema_l2_val:.4f}" if (ema_enabled and s == 0) else ""
+                )
                 print(
                     f"  t={n_actions_done + s + 1:02d}  r={float(r_t):+.4f}  "
                     + (
@@ -719,6 +766,7 @@ def _run_episode(
                         if state_t['success'] else "CV-FAIL"
                     )
                     + (f"  plan={plan_wall:.2f}s" if s == 0 else "  (sub-step)")
+                    + _ema_token
                 )
 
         if is_rank0:
@@ -872,6 +920,12 @@ def _run_episode(
         "wall_time_s": round(wall_total, 1),
         "wall_per_step_s": round(wall_total / max(1, int(cfg.control_steps)), 3),
         "n_gpus": int(getattr(args, "n_gpus", 1) or 1),
+        "action_ema": OmegaConf.to_container(
+            OmegaConf.select(cfg, "action_ema", default=OmegaConf.create({
+                "enabled": False, "alpha": 0.3, "init_mode": "first_mu",
+            })),
+            resolve=True,
+        ),
         "per_step": per_step,
     }
     summary["iteration_reward_viz"] = _write_iteration_visualizations(
@@ -1084,6 +1138,13 @@ def main() -> None:
              "Override when running multiple multi-GPU jobs concurrently on "
              "the same machine.",
     )
+    ap.add_argument(
+        "--cfg_overrides", type=str, nargs="*", default=[],
+        help="Generic OmegaConf dotlist overrides applied AFTER --config + "
+             "argparse overrides (e.g. --cfg_overrides action_ema.enabled=true "
+             "action_ema.alpha=0.3). Lets you toggle yaml-only knobs without "
+             "editing default.yaml.",
+    )
     args = ap.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -1097,6 +1158,8 @@ def main() -> None:
     # block and require --override_reason; per-run knobs (control_steps,
     # seed) mutate cfg silently because they don't change MPPI's algorithm.
     config_deviation = _apply_cli_overrides(cfg, args)
+    if args.cfg_overrides:
+        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(list(args.cfg_overrides)))
 
     # ── multi-GPU dispatch ───────────────────────────────────────────
     n_gpus = int(args.n_gpus)
