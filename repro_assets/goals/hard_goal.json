@@ -1,0 +1,31 @@
+{
+  "cx": 55.818560551280804,
+  "cy": 75.29597206475293,
+  "sin_theta": 0.9459956334800984,
+  "cos_theta": 0.3241793661487221,
+  "theta_deg": 71.0841354445343,
+  "resolution": 128,
+  "meta": {
+    "pair_id": "hard",
+    "source_hdf5": "data/mini/pusht/val/episode_1.hdf5",
+    "start_frame": 59,
+    "end_frame": 159,
+    "gap": 100,
+    "pos_change_px": 38.92042167317955,
+    "angle_change_deg": 30.847020318901798,
+    "preset": "candidates_picks_p33_p66_p95",
+    "raw_end_theta_from_candidates": 71.0841354445343,
+    "start_pose": {
+      "cx": 68.97718023437022,
+      "cy": 38.667431945688456,
+      "theta_deg": 101.9311557634361
+    },
+    "target_percentile": 95
+  },
+  "state": [
+    55.818560551280804,
+    75.29597206475293,
+    0.9459956334800984,
+    0.3241793661487221
+  ]
+}
